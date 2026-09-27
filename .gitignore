@@ -1,0 +1,11 @@
+node_modules/
+dist/
+tsconfig.tsbuildinfo
+
+# Playwright MCP 运行期产出的页面快照与控制台日志
+.playwright-mcp/
+
+# super-workflow 会话状态：索引与锁随会话改写，不进版本库
+.SAH/
+.claude/super-workflow/plan/session-index.json
+.claude/super-workflow/plan/*.lock
