@@ -14,7 +14,12 @@ const store = useGameStore()
 
 const myMeldText = computed(() => meldText(store.human.melds))
 const myDiscardText = computed(() => formatTileList(store.human.discards))
-/** 对手只报张数与副露，牌河细节留在日志里 */
+/** 其他三家的河，按座位顺序各占一行；只用于看已出现的牌，故不标注归属 */
+const opponentDiscardLines = computed(() =>
+  [1, 2, 3]
+    .map((offset) => (HUMAN_SEAT + offset) % 4)
+    .map((seat) => formatTileList(store.state.players[seat].discards)),
+)
 const opponentSummary = computed(() =>
   [1, 2, 3]
     .map((offset) => (HUMAN_SEAT + offset) % 4)
@@ -818,6 +823,10 @@ watch(
           <div class="status-line">
             <span class="label">我的河</span>
             <span class="value faint">{{ myDiscardText }}</span>
+          </div>
+          <div v-for="(line, index) in opponentDiscardLines" :key="index" class="status-line">
+            <span class="label">{{ index === 0 ? '他家河' : '' }}</span>
+            <span class="value faint">{{ line }}</span>
           </div>
           <div class="status-line">
             <span class="label">对手</span>
