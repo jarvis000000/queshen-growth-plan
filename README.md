@@ -2,6 +2,8 @@
 
 一个以**教学**为核心的温州麻将人机对战练习工具。三档 AI 对手、实时出牌胜率分析、对手牌型推断。
 
+**在线体验** → https://jarvis000000.github.io/queshen-growth-plan/
+
 ## 运行
 
 ```bash
@@ -10,6 +12,35 @@ npm run dev      # 开发服务器 http://localhost:5173
 npm test         # 引擎与对局模拟测试
 npm run build    # 生产构建
 ```
+
+## 部署
+
+### 在线预览
+
+**https://jarvis000000.github.io/queshen-growth-plan/**
+
+### 一键部署
+
+本项目是纯静态站点，**不需要后端、不需要任何环境变量**，点击下方按钮即可把仓库克隆到自己的账号并自动构建发布：
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fjarvis000000%2Fqueshen-growth-plan)
+[![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/jarvis000000/queshen-growth-plan)
+
+> Vercel 免费（Hobby）套餐不允许商用，个人练习无碍；需要商用请换 Netlify 或自建。
+
+### 部署到自己的 GitHub Pages
+
+本仓库已内置 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)，无需再写任何配置：
+
+1. Fork 本仓库
+2. 仓库 **Settings → Pages → Source** 选择 **GitHub Actions**
+3. 向 `main` 推送任意改动（或在 Actions 页手动 Run workflow）
+4. 访问 `https://<你的用户名>.github.io/<仓库名>/`
+
+推送后自动完成「安装依赖 → 类型检查 → 打包 → 发布」，约一分钟生效。
+构建失败时**线上保持旧版本**，不会把已发布的站点打挂。
+
+构建产物使用相对路径（`vite.config.ts` 中的 `base: './'`），因此无论放在仓库子路径还是域名根目录都能正常工作。
 
 ## 规则实现
 
