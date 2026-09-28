@@ -32,6 +32,7 @@ import {
   wallRemaining,
   type ClaimKind,
   type ClaimOption,
+  type GameResult,
   type GameState,
 } from '../engine/game'
 import { collectSupport, meldTilesOf } from '../engine/meld'
@@ -48,6 +49,8 @@ const ABORT_TILE = -1
 
 /** 出牌建议与最优解的分差达到该值时才提示玩家 */
 const ADVICE_ALERT_GAP = 12
+/** 建议前若干名都算「最佳选择」，不必强求打出唯一最优的那张 */
+export const BEST_RANK_LIMIT = 3
 
 const SETTINGS_KEY = 'queshen-settings'
 
@@ -111,16 +114,36 @@ export const useGameStore = defineStore('game', () => {
   /** 对局代次：重开时自增，旧循环据此在下一个检查点自行退出 */
   let generation = 0
 
+  /** 庄家座位与连庄次数：跨局保留，故不放进每局重建的 state */
+  const dealer = ref(0)
+  const dealerStreak = ref(0)
+
   watch(settings, (value) => saveJson(SETTINGS_KEY, value), { deep: true })
 
-  // 每局结算时记一次战绩。result 由 null 变为全新对象即代表本局已结束，
+  // 每局结算时记一次战绩并转交庄位。result 由 null 变为全新对象即代表本局已结束，
   // 重开时被 createGame() 清为 null，判真值即可避免重复计数
   watch(
     () => state.value.result,
     (result) => {
-      if (result) recordGame(result, HUMAN_SEAT)
+      if (!result) return
+      recordGame(result, HUMAN_SEAT)
+      advanceDealer(result)
     },
   )
+
+  /**
+   * 轮庄：庄家胡牌则连庄次数 +1（庄位不变），闲家胡牌则庄家下庄给下家且连庄归零。
+   * 流局无胡牌，庄位与连庄次数都不变。
+   */
+  function advanceDealer(result: GameResult): void {
+    if (result.draw) return
+    if (result.winners[0]?.seat === dealer.value) {
+      dealerStreak.value++
+      return
+    }
+    dealer.value = (dealer.value + 1) % SEATS
+    dealerStreak.value = 0
+  }
 
   const human = computed(() => state.value.players[HUMAN_SEAT])
   const followHonor = computed(() =>
@@ -148,6 +171,14 @@ export const useGameStore = defineStore('game', () => {
   const canCancelReady = computed(
     () => human.value.declaredReady && human.value.discards.length === readyDiscardMark.value,
   )
+  /** 本局四家净变化，双界面共用 */
+  const settlementText = computed(() => {
+    const deltas = state.value.result?.deltas
+    if (!deltas) return ''
+    return deltas
+      .map((value, seat) => `${SEAT_LABELS[seat]}${value > 0 ? `+${value}` : value}`)
+      .join('  ')
+  })
 
   function viewOfHuman() {
     return viewFor(state.value, HUMAN_SEAT)
@@ -155,6 +186,10 @@ export const useGameStore = defineStore('game', () => {
 
   function seatName(seat: number): string {
     return SEAT_LABELS[seat]
+  }
+
+  function isDealer(seat: number): boolean {
+    return seat === dealer.value
   }
 
   function relativeLabel(seat: number): string {
@@ -175,7 +210,7 @@ export const useGameStore = defineStore('game', () => {
     kongResolver = null
     selfWinResolver = null
 
-    state.value = createGame()
+    state.value = createGame(Math.random, dealer.value, dealerStreak.value)
     advice.value = null
     advicePending.value = false
     claimPrompt.value = null
@@ -213,6 +248,7 @@ export const useGameStore = defineStore('game', () => {
 
         // 杠后可连续补牌，补牌同样可能自摸或再次具备杠的条件
         let kong = await resolveSelfKong(currentSeat)
+        let kongChain = 0
         let kongEnded = false
         while (kong) {
           const supplement =
@@ -220,7 +256,8 @@ export const useGameStore = defineStore('game', () => {
               ? applyAnKong(game, currentSeat, kong.tile)
               : applyAddKong(game, currentSeat, kong.tile)
           if (supplement === null) break
-          if (await resolveSelfWin(currentSeat, supplement)) {
+          kongChain++
+          if (await resolveSelfWin(currentSeat, supplement, kongChain)) {
             kongEnded = true
             break
           }
@@ -257,13 +294,13 @@ export const useGameStore = defineStore('game', () => {
   }
 
   /** 摸牌后的自摸结算；人类玩家需确认，报听者自动成立 */
-  async function resolveSelfWin(seat: number, drawnTile: number): Promise<boolean> {
+  async function resolveSelfWin(seat: number, drawnTile: number, kongChain = 0): Promise<boolean> {
     const game = state.value
     const actions = findSelfActions(game, seat)
     if (!actions.winType) return false
 
     if (seat !== HUMAN_SEAT || human.value.declaredReady) {
-      settleWin(game, seat, null, drawnTile, actions.winType)
+      settleWin(game, seat, null, drawnTile, actions.winType, kongChain)
       return true
     }
 
@@ -274,7 +311,7 @@ export const useGameStore = defineStore('game', () => {
     selfWinPrompt.value = false
     if (!accepted) return false
 
-    settleWin(game, seat, null, drawnTile, actions.winType)
+    settleWin(game, seat, null, drawnTile, actions.winType, kongChain)
     return true
   }
 
@@ -366,7 +403,7 @@ export const useGameStore = defineStore('game', () => {
   }
 
   /**
-   * 该出牌与最优解的差距；打出的即最优、或无从比较时返回 null。
+   * 该出牌与最优解的差距；落在建议前几名内、或无从比较时返回 null。
    * significant 表示差距已大到需要完整对比的程度。
    */
   function adviceDiffFor(
@@ -376,7 +413,7 @@ export const useGameStore = defineStore('game', () => {
     if (!candidates || candidates.length < 2) return null
     const best = candidates[0]
     const chosen = candidates.find((candidate) => candidate.tile === tile)
-    if (!chosen || chosen.tile === best.tile) return null
+    if (!chosen || chosen.rank <= BEST_RANK_LIMIT) return null
     const gap = best.value - chosen.value
     return { best, chosen, gap, significant: gap >= ADVICE_ALERT_GAP }
   }
@@ -437,6 +474,8 @@ export const useGameStore = defineStore('game', () => {
     if (claims.length === 0) return null
     const ordered = [...claims].sort((a, b) => CLAIM_PRIORITY[b.kind] - CLAIM_PRIORITY[a.kind])
 
+    // 吃有多种组合，同一座位会产出多条响应，但玩家只该被询问一次
+    let askedHuman = false
     for (const claim of ordered) {
       if (claim.seat === HUMAN_SEAT) {
         // 报听：胡自动成立，其余响应一律放弃（手牌已锁死）
@@ -444,6 +483,8 @@ export const useGameStore = defineStore('game', () => {
           if (claim.kind === 'win') return executeClaim(claim)
           continue
         }
+        if (askedHuman) continue
+        askedHuman = true
         const accepted = await askHumanClaim(ordered)
         if (accepted) return executeClaim(accepted)
         continue
@@ -475,6 +516,19 @@ export const useGameStore = defineStore('game', () => {
     claimResolver = null
     claimPrompt.value = null
     resolve?.(accepted && option ? option : null)
+  }
+
+  /** 放弃当前响应：吃碰杠、明杠、自摸三处的「不作响应」语义相同，界面只需报一次意图 */
+  function dismissPrompt(): void {
+    if (claimPrompt.value) {
+      answerClaim(false)
+      return
+    }
+    if (kongPrompt.value) {
+      answerKong(null)
+      return
+    }
+    if (selfWinPrompt.value) answerSelfWin(false)
   }
 
   /**
@@ -560,6 +614,10 @@ export const useGameStore = defineStore('game', () => {
     isHumanTurn,
     canDiscard,
     canCancelReady,
+    dealer,
+    dealerStreak,
+    isDealer,
+    settlementText,
     awaitingHumanDiscard,
     turnSeq,
     wallLeft,
@@ -572,6 +630,7 @@ export const useGameStore = defineStore('game', () => {
     declareReady,
     cancelReady,
     answerKong,
+    dismissPrompt,
     answerSelfWin,
     scheduleOpponentRead,
     clearOpponentRead,

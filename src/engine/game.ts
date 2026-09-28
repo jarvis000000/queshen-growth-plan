@@ -1,17 +1,21 @@
 import { handSortValue, normalize } from './joker'
 import {
+  ADD_KONG_TILES,
+  AN_KONG_TILES,
   canKong,
   canPong,
   collectSupport,
   findAddKongTiles,
   findAnKongTiles,
   findChowOptions,
+  KONG_FROM_HAND,
   MELD_KIND,
   meldTilesOf,
+  PONG_FROM_HAND,
   type Meld,
 } from './meld'
 import { nextFollowHonor } from './rules'
-import { scoreWin, type ScoreResult } from './score'
+import { scoreWin, shareScore, UNIT, type ScoreResult } from './score'
 import { createWall, shuffle } from './tiles'
 import { createSeenCounter } from './ukeire'
 import { shantenCached } from './shanten'
@@ -53,6 +57,8 @@ export interface WinRecord {
 export interface GameResult {
   draw: boolean
   winners: WinRecord[]
+  /** 四家本局净变化，含杠分与放炮罚分；恒为零和 */
+  deltas: number[]
 }
 
 export interface GameState {
@@ -62,6 +68,10 @@ export interface GameState {
   wallCursor: number
   jokerTile: number
   dealer: number
+  /** 当前连庄次数，0 表示未连庄；得分按 ×2ⁿ 放大 */
+  dealerStreak: number
+  /** 本局各家累计杠分，局末并入 deltas */
+  kongPoints: number[]
   turn: number
   /** 待响应的打牌；null 表示当前处于摸牌阶段 */
   pending: PendingDiscard | null
@@ -98,7 +108,7 @@ export function sortHand(hand: number[], jokerTile: number): number[] {
   return hand.sort((a, b) => handSortValue(a, jokerTile) - handSortValue(b, jokerTile))
 }
 
-export function createGame(random: () => number = Math.random, dealer = 0): GameState {
+export function createGame(random: () => number = Math.random, dealer = 0, dealerStreak = 0): GameState {
   const wall = shuffle(createWall(), random)
   const jokerTile = wall[Math.floor(random() * wall.length)]
 
@@ -116,6 +126,8 @@ export function createGame(random: () => number = Math.random, dealer = 0): Game
     wallCursor: cursor,
     jokerTile,
     dealer,
+    dealerStreak,
+    kongPoints: Array.from({ length: SEATS }, () => 0),
     turn: dealer,
     pending: null,
     lastDiscard: null,
@@ -168,9 +180,10 @@ export type ClaimKind = keyof typeof CLAIM_PRIORITY
 export interface ClaimOption {
   seat: number
   kind: ClaimKind
-  /** 吃牌时使用的手牌组合 */
+  /** 该响应会从手牌里用掉的牌；胡牌不耗手牌，故缺省 */
   tiles?: number[]
 }
+
 
 /** 按逆时针顺序列出其他玩家对 pending 打牌的可行响应 */
 export function findClaims(state: GameState): ClaimOption[] {
@@ -185,8 +198,12 @@ export function findClaims(state: GameState): ClaimOption[] {
     if (detectWinType(...winArgsFor(player, pending.tile, state.jokerTile))) {
       options.push({ seat, kind: 'win' })
     }
-    if (canKong(player.hand, pending.tile, state.jokerTile)) options.push({ seat, kind: 'kong' })
-    if (canPong(player.hand, pending.tile, state.jokerTile)) options.push({ seat, kind: 'pong' })
+    if (canKong(player.hand, pending.tile, state.jokerTile)) {
+      options.push({ seat, kind: 'kong', tiles: collectSupport(player.hand, pending.tile, state.jokerTile, KONG_FROM_HAND) })
+    }
+    if (canPong(player.hand, pending.tile, state.jokerTile)) {
+      options.push({ seat, kind: 'pong', tiles: collectSupport(player.hand, pending.tile, state.jokerTile, PONG_FROM_HAND) })
+    }
     // 吃仅限下家
     if (offset === 1) {
       for (const combo of findChowOptions(player.hand, pending.tile, state.jokerTile)) {
@@ -248,11 +265,73 @@ function reclaimDiscard(state: GameState, from: number, tile: number): void {
   if (index !== -1) discards.splice(index, 1)
 }
 
+/**
+ * 杠分：其他三家各付一份，杠家收其余额（三家之和）。
+ * 暗杠按两份计，故杠家实得 6 份；加杠的第四张已副露，与明杠同价。
+ */
+function settleKongPoints(state: GameState, seat: number, concealed: boolean): void {
+  const unit = shareScore(concealed ? UNIT.CONCEALED_KONG : UNIT.EXPOSED_KONG)
+  for (let other = 0; other < SEATS; other++) {
+    if (other === seat) continue
+    state.kongPoints[other] -= unit
+    state.kongPoints[seat] += unit
+  }
+}
+
+/**
+ * 财神分：按暗牌中的财神张数，由持有者向其他三家各收一份。
+ * 副露中的财神不计；与胡牌无关，故流局同样结算。
+ */
+function applyJokerPoints(
+  state: GameState,
+  deltas: number[],
+  winnerSeat: number,
+  winnerTiles: readonly number[],
+): void {
+  for (let holder = 0; holder < SEATS; holder++) {
+    const tiles = holder === winnerSeat ? winnerTiles : state.players[holder].hand
+    const unit = shareScore(UNIT.JOKER) * normalize(tiles, state.jokerTile).wildcards
+    if (unit === 0) continue
+    for (let other = 0; other < SEATS; other++) {
+      if (other === holder) continue
+      deltas[other] -= unit
+      deltas[holder] += unit
+    }
+  }
+}
+
+/**
+ * 分家结算：三家各付一份「底分 × 倍数」，点炮者额外多付一份罚分；
+ * 财神分与杠分只跟底分相关、不参与倍数，三者叠加后恒为零和。
+ */
+function settlementOf(
+  state: GameState,
+  record: WinRecord,
+  winnerTiles: readonly number[],
+): number[] {
+  const { seat, from, score } = record
+  const deltas = state.kongPoints.slice()
+  applyJokerPoints(state, deltas, seat, winnerTiles)
+
+  const share = shareScore(score.multiplier)
+  for (let other = 0; other < SEATS; other++) {
+    if (other === seat) continue
+    deltas[other] -= share
+    deltas[seat] += share
+  }
+  // 放炮者多担一份罚分
+  if (from !== null) {
+    deltas[from] -= share
+    deltas[seat] += share
+  }
+  return deltas
+}
+
 export function applyPong(state: GameState, seat: number): boolean {
   const pending = state.pending
   if (!pending) return false
   const player = state.players[seat]
-  const used = collectSupport(player.hand, pending.tile, state.jokerTile, 2)
+  const used = collectSupport(player.hand, pending.tile, state.jokerTile, PONG_FROM_HAND)
   if (used.length < 2) return false
 
   removeTiles(player.hand, used)
@@ -285,12 +364,13 @@ export function applyKong(state: GameState, seat: number): number | null {
   const pending = state.pending
   if (!pending) return null
   const player = state.players[seat]
-  const used = collectSupport(player.hand, pending.tile, state.jokerTile, 3)
-  if (used.length < 3) return null
+  const used = collectSupport(player.hand, pending.tile, state.jokerTile, KONG_FROM_HAND)
+  if (used.length < KONG_FROM_HAND) return null
 
   removeTiles(player.hand, used)
   player.melds.push({ kind: MELD_KIND.KONG, tiles: [pending.tile, ...used], from: pending.from })
   reclaimDiscard(state, pending.from, pending.tile)
+  settleKongPoints(state, seat, false)
   state.turn = seat
   state.pending = null
   return drawTile(state, seat)
@@ -298,10 +378,11 @@ export function applyKong(state: GameState, seat: number): number | null {
 
 export function applyAnKong(state: GameState, seat: number, tile: number): number | null {
   const player = state.players[seat]
-  const used = collectSupport(player.hand, tile, state.jokerTile, 4)
-  if (used.length < 4) return null
+  const used = collectSupport(player.hand, tile, state.jokerTile, AN_KONG_TILES)
+  if (used.length < AN_KONG_TILES) return null
   removeTiles(player.hand, used)
   player.melds.push({ kind: MELD_KIND.AN_KONG, tiles: used, from: null })
+  settleKongPoints(state, seat, true)
   return drawTile(state, seat)
 }
 
@@ -310,12 +391,13 @@ export function applyAddKong(state: GameState, seat: number, tile: number): numb
   const player = state.players[seat]
   const meld = player.melds.find((item) => item.kind === MELD_KIND.PONG && item.tiles[0] === tile)
   if (!meld) return null
-  const used = collectSupport(player.hand, tile, state.jokerTile, 1)
-  if (used.length < 1) return null
+  const used = collectSupport(player.hand, tile, state.jokerTile, ADD_KONG_TILES)
+  if (used.length < ADD_KONG_TILES) return null
 
   removeTiles(player.hand, used)
   meld.kind = MELD_KIND.KONG
   meld.tiles = [...meld.tiles, ...used]
+  settleKongPoints(state, seat, false)
   return drawTile(state, seat)
 }
 
@@ -325,6 +407,8 @@ export function settleWin(
   from: number | null,
   tile: number,
   winType: WinType,
+  /** 本手胡牌的摸牌来自连开杠的补牌：0 为普通摸牌，1 为杠开，2 及以上为二连杠 */
+  kongChain = 0,
 ): WinRecord {
   const player = state.players[seat]
   const allTiles = [...player.hand, ...meldTilesOf(player.melds), tile]
@@ -338,6 +422,8 @@ export function settleWin(
     jokerTile: state.jokerTile,
     allTiles,
     selfDraw: from === null,
+    dealerStreak: state.dealerStreak,
+    kongChain,
   })
 
   if (from === null) {
@@ -348,13 +434,17 @@ export function settleWin(
   }
 
   const record: WinRecord = { seat, from, tile, winType, score }
-  state.result = { draw: false, winners: [record] }
+  // 自摸时赢牌张已并入暗牌，点炮时需补上才能与手牌一起计入财神
+  const winnerTiles = from === null ? player.hand : [...player.hand, tile]
+  state.result = { draw: false, winners: [record], deltas: settlementOf(state, record, winnerTiles) }
   state.pending = null
   return record
 }
 
 export function settleDraw(state: GameState): void {
-  state.result = { draw: true, winners: [] }
+  const deltas = state.kongPoints.slice()
+  applyJokerPoints(state, deltas, -1, [])
+  state.result = { draw: true, winners: [], deltas }
   state.pending = null
 }
 

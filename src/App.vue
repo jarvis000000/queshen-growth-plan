@@ -4,9 +4,10 @@ import PlainMode from './components/PlainMode.vue'
 import StatsPanel from './components/StatsPanel.vue'
 import TileView from './components/TileView.vue'
 import { DIFFICULTY_LABELS, relativeRates, type Difficulty, type DiscardCandidate } from './engine/ai'
-import { MELD_KIND, type Meld } from './engine/meld'
+import { ADD_KONG_TILES, AN_KONG_TILES, collectSupport, meldKindLabel } from './engine/meld'
+import { formatScoreLine } from './engine/score'
 import { tileName } from './engine/tiles'
-import { HUMAN_SEAT, useGameStore } from './stores/game'
+import { BEST_RANK_LIMIT, HUMAN_SEAT, useGameStore } from './stores/game'
 
 const store = useGameStore()
 
@@ -51,7 +52,7 @@ const hoverTip = computed(() => {
     tile,
     blocked: false,
     rate: (rates.value[index] ?? 0) * 100,
-    isBest: index === 0,
+    isBest: item.rank <= BEST_RANK_LIMIT,
     rank: item.rank,
     total: list.length,
     shanten: item.shanten,
@@ -74,9 +75,7 @@ const resultText = computed(() => {
 })
 const resultDetail = computed(() => {
   const record = store.state.result?.winners[0]
-  if (!record) return ''
-  const score = record.score
-  return `${score.labels.join(' · ')}｜${score.hard ? '硬牌' : '软牌'} ${score.multiplier} 倍｜财神分 ${score.jokerScore}｜合计 ${score.total}`
+  return record ? formatScoreLine(record.score) : ''
 })
 
 function isJoker(tile: number): boolean {
@@ -91,10 +90,89 @@ function claimLabel(kind: string): string {
   return kind === 'chow' ? '吃' : kind === 'pong' ? '碰' : kind === 'kong' ? '杠' : '胡'
 }
 
-function meldLabel(meld: Meld): string {
-  if (meld.kind === MELD_KIND.CHOW) return '吃'
-  if (meld.kind === MELD_KIND.PONG) return '碰'
-  return '杠'
+interface ResponseItem {
+  key: string
+  label: string
+  /** 该响应会从手牌里用掉的牌，界面据此把它们提起 */
+  tiles: number[]
+  /** 放弃类项，用弱化样式与响应项区分 */
+  ghost?: boolean
+  run: () => void
+}
+
+/**
+ * 当前可做的响应。吃碰杠、摸牌后的明暗杠、自摸胡三种提示互斥，
+ * 故合并为同一份列表，按钮区与键盘各自只需一套。
+ */
+const responseItems = computed<ResponseItem[]>(() => {
+  const claim = store.claimPrompt
+  if (claim) {
+    const items: ResponseItem[] = claim.options.map((option, index) => ({
+      key: `claim-${index}-${option.kind}`,
+      label: claimLabel(option.kind),
+      tiles: option.tiles ?? [],
+      run: () => store.answerClaim(true, option),
+    }))
+    if (claim.canDeclareReady) {
+      items.push({ key: 'ready', label: '听牌', tiles: [], ghost: true, run: () => store.declareReady() })
+    }
+    items.push({ key: 'pass', label: '过', tiles: [], ghost: true, run: () => store.answerClaim(false) })
+    return items
+  }
+
+  const kong = store.kongPrompt
+  if (kong) {
+    const lift = (tile: number, count: number): number[] =>
+      collectSupport(store.human.hand, tile, store.state.jokerTile, count)
+    return [
+      ...kong.anKongs.map((tile) => ({
+        key: `an-${tile}`,
+        label: `暗杠 ${tileName(tile)}`,
+        tiles: lift(tile, AN_KONG_TILES),
+        run: () => store.answerKong(tile),
+      })),
+      ...kong.addKongs.map((tile) => ({
+        key: `add-${tile}`,
+        label: `加杠 ${tileName(tile)}`,
+        tiles: lift(tile, ADD_KONG_TILES),
+        run: () => store.answerKong(tile),
+      })),
+      { key: 'skip', label: '过', tiles: [], ghost: true, run: () => store.answerKong(null) },
+    ]
+  }
+
+  if (store.selfWinPrompt) {
+    return [
+      { key: 'win', label: '胡牌', tiles: [], run: () => store.answerSelfWin(true) },
+      { key: 'skip', label: '继续打', tiles: [], ghost: true, run: () => store.answerSelfWin(false) },
+    ]
+  }
+  return []
+})
+
+const responseCursor = ref(0)
+
+/** 当前响应项会用手牌里的哪几张：按牌值依次认领，同种牌有多张时才能对上结算实际移除的那几张 */
+const responseLiftIndexes = computed(() => {
+  const wanted = [...(responseItems.value[responseCursor.value]?.tiles ?? [])]
+  const indexes: number[] = []
+  store.human.hand.forEach((tile, index) => {
+    const at = wanted.indexOf(tile)
+    if (at === -1) return
+    wanted.splice(at, 1)
+    indexes.push(index)
+  })
+  return indexes
+})
+
+const responseHead = computed(() => {
+  if (store.claimPrompt) return `可以响应 ${tileName(store.claimPrompt.tile)}`
+  return store.kongPrompt ? '可以杠' : '可以自摸胡牌'
+})
+
+/** 座位标题：庄家额外标注，便于与「相对位置」的座位头对应 */
+function seatHeadLabel(seat: number): string {
+  return store.isDealer(seat) ? `庄 · ${store.relativeLabel(seat)}` : store.relativeLabel(seat)
 }
 
 async function pickTile(tile: number): Promise<void> {
@@ -139,8 +217,6 @@ function restart(difficulty: Difficulty): void {
 
 const cursorIndex = ref(0)
 const liftedIndex = ref<number | null>(null)
-const claimCursor = ref(0)
-const kongCursor = ref(0)
 
 // 每次轮到自己时把光标与提起位落到刚摸的那张，回车即可直接打出；
 // 摸到的牌受跟打限制或无从识别时，退回第一张可打出的牌
@@ -170,19 +246,10 @@ watch(
   },
 )
 
-watch(
-  () => store.claimPrompt,
-  () => {
-    claimCursor.value = 0
-  },
-)
-
-watch(
-  () => store.kongPrompt,
-  () => {
-    kongCursor.value = 0
-  },
-)
+// 每次进入响应态都从第一项起步，回车即确认排在最前的那个响应
+watch([() => store.claimPrompt, () => store.kongPrompt, () => store.selfWinPrompt], () => {
+  responseCursor.value = 0
+})
 
 /** 手牌导航：←→ 在可打出的牌之间移动，↑ 提牌，↓ 放回，回车或空格打出 */
 function handleHandKeys(event: KeyboardEvent): void {
@@ -219,50 +286,21 @@ function handleHandKeys(event: KeyboardEvent): void {
   }
 }
 
-function handleClaimKeys(event: KeyboardEvent): void {
-  const prompt = store.claimPrompt
-  const options = prompt?.options ?? []
-  if (!prompt || options.length === 0) return
-  // 报听项排在响应选项之后，光标只能多走这一格；「过」仍只走点击与 Esc
-  const total = options.length + (prompt.canDeclareReady ? 1 : 0)
+function handleResponseKeys(event: KeyboardEvent): void {
+  const total = responseItems.value.length
+  if (total === 0) return
   if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
     event.preventDefault()
-    claimCursor.value = claimCursor.value <= 0 ? total - 1 : claimCursor.value - 1
+    responseCursor.value = (responseCursor.value + total - 1) % total
   } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
     event.preventDefault()
-    claimCursor.value = (claimCursor.value + 1) % total
+    responseCursor.value = (responseCursor.value + 1) % total
   } else if (event.key === 'Enter' || event.key === ' ') {
     event.preventDefault()
-    if (prompt.canDeclareReady && claimCursor.value === options.length) {
-      store.declareReady()
-      return
-    }
-    const option = options[claimCursor.value]
-    if (option) store.answerClaim(true, option)
+    responseItems.value[responseCursor.value]?.run()
   } else if (event.key === 'Escape') {
     event.preventDefault()
-    store.answerClaim(false)
-  }
-}
-
-function handleKongKeys(event: KeyboardEvent): void {
-  const prompt = store.kongPrompt
-  if (!prompt) return
-  const tiles = [...prompt.anKongs, ...prompt.addKongs]
-  if (tiles.length === 0) return
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
-    event.preventDefault()
-    kongCursor.value = kongCursor.value <= 0 ? tiles.length - 1 : kongCursor.value - 1
-  } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
-    event.preventDefault()
-    kongCursor.value = (kongCursor.value + 1) % tiles.length
-  } else if (event.key === 'Enter' || event.key === ' ') {
-    event.preventDefault()
-    const tile = tiles[kongCursor.value]
-    if (tile !== undefined) store.answerKong(tile)
-  } else if (event.key === 'Escape') {
-    event.preventDefault()
-    store.answerKong(null)
+    store.dismissPrompt()
   }
 }
 
@@ -270,23 +308,11 @@ function onGlobalKeydown(event: KeyboardEvent): void {
   // 摸鱼模式自带一套键盘处理，避免两边抢方向键
   if (store.settings.plainMode) return
   if (event.metaKey || event.ctrlKey || event.altKey) return
-  // 战绩面板盖在对局弹层之上，打开期间必须让对局键盘动作整体停摆，
-  // 否则被面板遮住的吃碰杠/自摸提示仍会响应回车，替玩家静默做决定
-  if (statsOpen.value) return
+  // 弹层盖住手牌区后，棋盘上的提示已不可见，此时必须让对局键盘整体停摆，
+  // 否则被遮住的响应项仍会响应回车，替玩家静默做决定
+  if (statsOpen.value || adviceOpen.value || readOpen.value || settingsOpen.value || store.state.result) return
 
-  if (store.claimPrompt) return handleClaimKeys(event)
-  if (store.kongPrompt) return handleKongKeys(event)
-  if (store.selfWinPrompt) {
-    if (event.key === 'Enter' || event.key === ' ') {
-      event.preventDefault()
-      store.answerSelfWin(true)
-    } else if (event.key === 'Escape') {
-      event.preventDefault()
-      store.answerSelfWin(false)
-    }
-    return
-  }
-  if (adviceOpen.value || readOpen.value || settingsOpen.value || store.state.result) return
+  if (responseItems.value.length > 0) return handleResponseKeys(event)
 
   handleHandKeys(event)
 }
@@ -315,6 +341,7 @@ onBeforeUnmount(() => {
           须跟打 {{ tileName(store.followHonor) }}
         </span>
         <span v-if="store.human.declaredReady" class="chip">已听牌</span>
+        <span v-if="store.dealerStreak > 0" class="chip warn">连庄 {{ store.dealerStreak }} 次</span>
       </div>
       <div class="difficulty">
         <button
@@ -329,13 +356,14 @@ onBeforeUnmount(() => {
         <button v-if="store.canCancelReady" type="button" class="icon" @click="store.cancelReady()">取消听牌</button>
         <button type="button" class="icon" @click="statsOpen = true">战绩</button>
         <button type="button" class="icon" @click="settingsOpen = true">设置</button>
+        <button type="button" class="icon" @click="store.settings.plainMode = true">摸鱼模式</button>
       </div>
     </header>
 
     <main class="table">
       <section class="seat seat-top" @click="openRead(seatLayout.top)">
         <div class="seat-head">
-          <strong>{{ store.relativeLabel(seatLayout.top) }}</strong>
+          <strong>{{ seatHeadLabel(seatLayout.top) }}</strong>
           <span>手牌 {{ store.handTilesOf(seatLayout.top).length }} 张</span>
         </div>
         <div class="backs">
@@ -353,7 +381,7 @@ onBeforeUnmount(() => {
 
       <section class="seat seat-left" @click="openRead(seatLayout.left)">
         <div class="seat-head">
-          <strong>{{ store.relativeLabel(seatLayout.left) }}</strong>
+          <strong>{{ seatHeadLabel(seatLayout.left) }}</strong>
           <span>{{ store.handTilesOf(seatLayout.left).length }} 张</span>
         </div>
         <div class="backs column">
@@ -382,7 +410,7 @@ onBeforeUnmount(() => {
 
       <section class="seat seat-right" @click="openRead(seatLayout.right)">
         <div class="seat-head">
-          <strong>{{ store.relativeLabel(seatLayout.right) }}</strong>
+          <strong>{{ seatHeadLabel(seatLayout.right) }}</strong>
           <span>{{ store.handTilesOf(seatLayout.right).length }} 张</span>
         </div>
         <div class="backs column">
@@ -401,80 +429,73 @@ onBeforeUnmount(() => {
 
     <footer class="mine">
       <div class="mine-head">
-        <strong>我的手牌</strong>
+        <strong>我的手牌{{ store.isDealer(HUMAN_SEAT) ? ' · 庄' : '' }}</strong>
         <span v-if="store.advicePending" class="hint">正在计算出牌建议…</span>
         <span v-else-if="store.settings.highlightBest && best && store.canDiscard" class="hint">
           推荐：{{ tileName(best.tile) }}（{{ best.shanten <= 0 ? '听牌' : `${best.shanten} 向听` }}，进张 {{ best.ukeireTotal }} 张）
         </span>
-        <span class="hint">←→ 选牌 · ↑ 提牌 · 空格出牌 · 悬停看胜率</span>
-      </div>
-      <div v-if="store.kongPrompt" class="kong-bar">
-        <span>可以杠：</span>
-        <button
-          v-for="(tile, i) in store.kongPrompt.anKongs"
-          :key="`an-${tile}`"
-          type="button"
-          class="primary"
-          :class="{ active: kongCursor === i }"
-          @click="store.answerKong(tile)"
-        >
-          暗杠 {{ tileName(tile) }}
-        </button>
-        <button
-          v-for="(tile, i) in store.kongPrompt.addKongs"
-          :key="`add-${tile}`"
-          type="button"
-          class="primary"
-          :class="{ active: kongCursor === store.kongPrompt.anKongs.length + i }"
-          @click="store.answerKong(tile)"
-        >
-          加杠 {{ tileName(tile) }}
-        </button>
-        <button type="button" class="ghost" @click="store.answerKong(null)">过</button>
+        <span class="hint">
+          {{ responseItems.length > 0 ? '←→ 切换响应 · 回车确认 · Esc 放弃' : '←→ 选牌 · ↑ 提牌 · 空格出牌 · 悬停看胜率' }}
+        </span>
       </div>
       <div class="mine-melds">
         <div v-for="(meld, i) in store.openMelds(HUMAN_SEAT)" :key="i" class="meld">
-          <span class="meld-tag">{{ meldLabel(meld) }}</span>
+          <span class="meld-tag">{{ meldKindLabel(meld.kind) }}</span>
           <TileView v-for="(tile, j) in meld.tiles" :key="j" :tile="tile" small />
         </div>
       </div>
-      <div class="hand">
-        <div
-          v-for="(tile, i) in store.human.hand"
-          :key="`${tile}-${i}`"
-          class="hand-item"
-          :class="{ 'tip-right': i >= store.human.hand.length / 2 }"
-          @mouseenter="hoveredIndex = i"
-          @mouseleave="hoveredIndex = null"
-        >
-          <TileView
-            :tile="tile"
-            :joker="isJoker(tile)"
-            :proxy="isProxy(tile)"
-            :clickable="store.canDiscard && store.legalTiles.has(tile)"
-            :dimmed="store.canDiscard && !store.legalTiles.has(tile)"
-            :highlighted="store.settings.highlightBest && best?.tile === tile && store.canDiscard"
-            :focused="store.canDiscard && i === cursorIndex"
-            :lifted="store.canDiscard && i === liftedIndex"
-            @pick="pickTile(tile)"
-          />
+      <div class="mine-body">
+        <div class="hand">
           <div
-            v-if="hoverTip && hoveredIndex === i"
-            class="rate-tip"
-            :class="{ best: !hoverTip.blocked && hoverTip.isBest, blocked: hoverTip.blocked }"
+            v-for="(tile, i) in store.human.hand"
+            :key="`${tile}-${i}`"
+            class="hand-item"
+            :class="{ 'tip-right': i >= store.human.hand.length / 2 }"
+            @mouseenter="hoveredIndex = i"
+            @mouseleave="hoveredIndex = null"
           >
-            <template v-if="hoverTip.blocked">
-              <strong>当前不可打出</strong>
-              <span>有风跟打：牌河末张的字牌，手中仅一张时须跟打</span>
-            </template>
-            <template v-else>
-              <strong>{{ hoverTip.isBest ? '✓ 最佳出牌' : `第 ${hoverTip.rank} 选 / 共 ${hoverTip.total} 张` }}</strong>
-              <span class="tip-rate">胜率 {{ hoverTip.rate.toFixed(1) }}%</span>
-              <span>
-                {{ hoverTip.shanten <= 0 ? '打出即听牌' : `打出后 ${hoverTip.shanten} 向听` }} · 进张 {{ hoverTip.ukeire }} 张
-              </span>
-            </template>
+            <TileView
+              :tile="tile"
+              :joker="isJoker(tile)"
+              :proxy="isProxy(tile)"
+              :clickable="store.canDiscard && store.legalTiles.has(tile)"
+              :dimmed="store.canDiscard && !store.legalTiles.has(tile)"
+              :highlighted="store.settings.highlightBest && best?.tile === tile && store.canDiscard"
+              :focused="store.canDiscard && i === cursorIndex"
+              :lifted="(store.canDiscard && i === liftedIndex) || responseLiftIndexes.includes(i)"
+              @pick="pickTile(tile)"
+            />
+            <div
+              v-if="hoverTip && hoveredIndex === i"
+              class="rate-tip"
+              :class="{ best: !hoverTip.blocked && hoverTip.isBest, blocked: hoverTip.blocked }"
+            >
+              <template v-if="hoverTip.blocked">
+                <strong>当前不可打出</strong>
+                <span>有风跟打：牌河末张的字牌，手中仅一张时须跟打</span>
+              </template>
+              <template v-else>
+                <strong>{{ hoverTip.isBest ? '✓ 最佳出牌' : `第 ${hoverTip.rank} 选 / 共 ${hoverTip.total} 张` }}</strong>
+                <span class="tip-rate">胜率 {{ hoverTip.rate.toFixed(1) }}%</span>
+                <span>
+                  {{ hoverTip.shanten <= 0 ? '打出即听牌' : `打出后 ${hoverTip.shanten} 向听` }} · 进张 {{ hoverTip.ukeire }} 张
+                </span>
+              </template>
+            </div>
           </div>
+        </div>
+        <div v-if="responseItems.length > 0" class="responses">
+          <span class="responses-head">{{ responseHead }}</span>
+          <button
+            v-for="(item, i) in responseItems"
+            :key="item.key"
+            type="button"
+            :class="[item.ghost ? 'ghost' : 'primary', { active: i === responseCursor }]"
+            @mouseenter="responseCursor = i"
+            @click="item.run()"
+          >
+            {{ item.label }}
+          </button>
         </div>
       </div>
       <div class="mine-pool">
@@ -510,13 +531,6 @@ onBeforeUnmount(() => {
             <span>
               <b>高亮推荐牌</b>
               <em>在手牌上标出当前推荐打出的牌，并在牌桌提示推荐结论</em>
-            </span>
-          </label>
-          <label>
-            <input v-model="store.settings.plainMode" type="checkbox" />
-            <span>
-              <b>摸鱼模式</b>
-              <em>收起图形牌桌，改为纯文字命令行交互，整页呈现为一份对局记录</em>
             </span>
           </label>
         </div>
@@ -610,48 +624,11 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div v-if="store.claimPrompt" class="overlay">
-      <div class="dialog narrow">
-        <h2>可以响应 {{ tileName(store.claimPrompt.tile) }}</h2>
-        <div class="dialog-actions">
-          <button
-            v-for="(option, i) in store.claimPrompt.options"
-            :key="`${option.kind}-${option.tiles?.join(',') ?? ''}`"
-            type="button"
-            class="primary"
-            :class="{ active: claimCursor === i }"
-            @click="store.answerClaim(true, option)"
-          >
-            {{ claimLabel(option.kind) }}
-          </button>
-          <button
-            v-if="store.claimPrompt.canDeclareReady"
-            type="button"
-            class="ghost"
-            :class="{ active: claimCursor === store.claimPrompt.options.length }"
-            @click="store.declareReady()"
-          >
-            听牌
-          </button>
-          <button type="button" class="ghost" @click="store.answerClaim(false)">过</button>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="store.selfWinPrompt" class="overlay">
-      <div class="dialog narrow">
-        <h2>可以自摸胡牌</h2>
-        <div class="dialog-actions">
-          <button type="button" class="primary" @click="store.answerSelfWin(true)">胡牌</button>
-          <button type="button" class="ghost" @click="store.answerSelfWin(false)">继续打</button>
-        </div>
-      </div>
-    </div>
-
     <div v-if="store.state.result" class="overlay">
       <div class="dialog narrow">
         <h2>{{ resultText }}</h2>
         <p v-if="resultDetail" class="lead">{{ resultDetail }}</p>
+        <p v-if="store.settlementText" class="lead">{{ store.settlementText }}</p>
         <div class="dialog-actions">
           <button type="button" class="primary" @click="restart(store.difficulty)">再来一局</button>
         </div>
@@ -890,8 +867,17 @@ h1 {
   gap: 10px;
 }
 
+.mine-body {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+}
+
 .hand {
   display: flex;
+  flex: 1;
+  /* 不置 0 则最小宽度取内容宽度，手牌会把响应按钮顶出容器 */
+  min-width: 0;
   flex-wrap: wrap;
   gap: 4px;
 }
@@ -953,31 +939,41 @@ h1 {
   font-weight: 700;
 }
 
-.kong-bar {
+.responses {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: 10px;
   background: rgba(217, 165, 32, 0.18);
-  font-size: 13px;
 }
 
-.kong-bar button {
-  padding: 5px 12px;
+.responses-head {
+  font-size: 12px;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.responses button {
+  padding: 6px 14px;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.22);
   background: transparent;
   color: inherit;
-  font-size: 12px;
+  font-size: 13px;
+  white-space: nowrap;
   cursor: pointer;
 }
 
-.kong-bar button.primary {
+.responses button.primary {
   background: #e0a815;
   border-color: #e0a815;
   color: #2b1d00;
   font-weight: 700;
+}
+
+.responses button.ghost:hover {
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .settings-list {
@@ -1177,7 +1173,7 @@ h1 {
 
 /* 键盘光标所在项 */
 .dialog-actions button.active,
-.kong-bar button.active {
+.responses button.active {
   outline: 2px solid #ffd479;
   outline-offset: 1px;
 }

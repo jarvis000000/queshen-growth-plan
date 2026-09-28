@@ -18,7 +18,7 @@ export interface GameStats {
   draws: number
   /** 他家胡牌且非人类放炮的局数 */
   others: number
-  /** 累计净分：胡牌加赢家合计分，放炮同额扣减，其余 0 */
+  /** 累计净分：由引擎分家结算累加，含杠分与放炮罚分 */
   score: number
   /** 打出即最优解的手数 */
   best: number
@@ -54,26 +54,19 @@ export function recordDiscard(rating: DiscardRating): void {
   save()
 }
 
-/**
- * 结算一局。引擎只记录赢家分数、没有分家结算，
- * 故净分按「赢时加赢家合计分、放炮时同额扣、其余 0」推导。
- */
+/** 结算一局：净分取引擎的分家结算（含杠分与放炮罚分） */
 export function recordGame(result: GameResult, humanSeat: number): void {
   stats.games++
+  stats.score += result.deltas[humanSeat] ?? 0
   if (result.draw) {
     stats.draws++
-  } else {
-    const record = result.winners[0]
-    if (record?.seat === humanSeat) {
-      stats.wins++
-      stats.score += record.score.total
-    } else if (record?.from === humanSeat) {
-      stats.dealIns++
-      stats.score -= record.score.total
-    } else {
-      stats.others++
-    }
+    save()
+    return
   }
+  const record = result.winners[0]
+  if (record?.seat === humanSeat) stats.wins++
+  else if (record?.from === humanSeat) stats.dealIns++
+  else stats.others++
   save()
 }
 

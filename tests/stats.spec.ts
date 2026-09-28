@@ -15,9 +15,13 @@ async function waitUntil(cond: () => boolean, timeout = 5000): Promise<void> {
   while (!cond() && Date.now() < deadline) await delay(20)
 }
 
-function gameResult(options: { draw?: boolean; seat?: number; from?: number | null; total?: number } = {}): GameResult {
-  const { draw = false, seat = HUMAN_SEAT, from = null, total = 10 } = options
-  if (draw) return { draw: true, winners: [] }
+/**
+ * 手写一局结果。deltas 由用例显式给出以锁定净分口径；
+ * 其中的 score 仅作占位（净分不再由它推导）。
+ */
+function gameResult(options: { draw?: boolean; seat?: number; from?: number | null; deltas?: number[] } = {}): GameResult {
+  const { draw = false, seat = HUMAN_SEAT, from = null, deltas = [0, 0, 0, 0] } = options
+  if (draw) return { draw: true, winners: [], deltas }
   return {
     draw: false,
     winners: [
@@ -26,9 +30,10 @@ function gameResult(options: { draw?: boolean; seat?: number; from?: number | nu
         from,
         tile: 0,
         winType: WIN_TYPE.STANDARD,
-        score: { patterns: [], hard: false, multiplier: 1, jokerScore: 0, total, labels: [] },
+        score: { patterns: [], multipliers: [], multiplier: 1, jokerScore: 0, total: 10, labels: [] },
       },
     ],
+    deltas,
   }
 }
 
@@ -58,29 +63,29 @@ describe('战绩累计', () => {
     resetStats()
   })
 
-  it('人类胡牌计入胡牌局数并加赢家合计分', () => {
-    recordGame(gameResult({ total: 18 }), HUMAN_SEAT)
+  it('人类胡牌计入胡牌局数并累加本人分家结算分', () => {
+    recordGame(gameResult({ deltas: [18, -6, -6, -6] }), HUMAN_SEAT)
     expect(stats.games).toBe(1)
     expect(stats.wins).toBe(1)
     expect(stats.score).toBe(18)
   })
 
-  it('人类放炮扣减同一分值', () => {
-    recordGame(gameResult({ seat: 2, from: HUMAN_SEAT, total: 24 }), HUMAN_SEAT)
+  it('人类放炮按其分家结算分扣减', () => {
+    recordGame(gameResult({ seat: 2, from: HUMAN_SEAT, deltas: [-25, 5, 15, 5] }), HUMAN_SEAT)
     expect(stats.dealIns).toBe(1)
-    expect(stats.score).toBe(-24)
+    expect(stats.score).toBe(-25)
   })
 
-  it('他家胡且人类未放炮只计数不计分', () => {
-    recordGame(gameResult({ seat: 2, from: 3, total: 24 }), HUMAN_SEAT)
+  it('他家胡且人类未放炮只计数，但杠分仍计入净分', () => {
+    recordGame(gameResult({ seat: 2, from: 3, deltas: [2, -3, 4, -3] }), HUMAN_SEAT)
     expect(stats.others).toBe(1)
-    expect(stats.score).toBe(0)
+    expect(stats.score).toBe(2)
   })
 
-  it('流局只计局数', () => {
-    recordGame(gameResult({ draw: true }), HUMAN_SEAT)
+  it('流局只计局数，杠分仍计入净分', () => {
+    recordGame(gameResult({ draw: true, deltas: [3, -1, -1, -1] }), HUMAN_SEAT)
     expect(stats.draws).toBe(1)
-    expect(stats.score).toBe(0)
+    expect(stats.score).toBe(3)
   })
 })
 
@@ -122,7 +127,7 @@ describe('汇总口径', () => {
 
   it('清空后全部归零', () => {
     recordDiscard('blunder')
-    recordGame(gameResult({ total: 30 }), HUMAN_SEAT)
+    recordGame(gameResult({ deltas: [30, -10, -10, -10] }), HUMAN_SEAT)
     resetStats()
     expect(summarize(stats).empty).toBe(true)
     expect(stats.score).toBe(0)
@@ -173,6 +178,35 @@ describe('出牌评级接入', { timeout: 20000 }, () => {
     expect(best).toBeDefined()
     store.commitDiscard(best as number)
     expect(stats.best).toBe(1)
+    expect(summarize(stats).hands).toBe(1)
+    store.reset()
+  })
+
+  it('建议前三名都记为最优', async () => {
+    const store = useGameStore()
+    void store.start()
+    await waitUntil(() => store.canDiscard)
+    await waitUntil(() => (store.advice?.candidates.length ?? 0) >= 4)
+
+    const third = (store.advice?.candidates ?? []).find((item) => item.rank === 3)
+    expect(third).toBeDefined()
+    store.commitDiscard(third?.tile as number)
+
+    expect(stats.best).toBe(1)
+    store.reset()
+  })
+
+  it('第四名起不再记为最优', async () => {
+    const store = useGameStore()
+    void store.start()
+    await waitUntil(() => store.canDiscard)
+    await waitUntil(() => (store.advice?.candidates.length ?? 0) >= 5)
+
+    const fourth = (store.advice?.candidates ?? []).find((item) => item.rank === 4)
+    expect(fourth).toBeDefined()
+    store.commitDiscard(fourth?.tile as number)
+
+    expect(stats.best).toBe(0)
     expect(summarize(stats).hands).toBe(1)
     store.reset()
   })

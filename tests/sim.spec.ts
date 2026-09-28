@@ -270,13 +270,14 @@ describe('副露结算', () => {
     const jokerTile = 0
     game.jokerTile = jokerTile
     const seat = 2
-    // 手中一张一万加一张白板，可碰一万
+    // 手中一张财神（即一万）加一张白板，可碰一万
     game.players[seat].hand = [0, 33, 5, 6, 7, 12, 13, 14, 20, 21, 22, 27, 27, 30, 31, 32]
     game.pending = { tile: 0, from: 1 }
     game.players[1].discards.push(0)
 
     expect(applyPong(game, seat)).toBe(true)
-    expect(game.players[seat].melds[0].tiles).toEqual([0, 0, 33])
+    // 首张固定为被响应的那张（加杠据此识别），其余两张是白板与财神牌
+    expect(game.players[seat].melds[0].tiles).toEqual([0, 33, 0])
   })
 })
 

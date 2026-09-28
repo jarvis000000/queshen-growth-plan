@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { relativeRates, type DiscardCandidate } from '../engine/ai'
-import { MELD_KIND, type Meld } from '../engine/meld'
+import { meldKindLabel, type Meld } from '../engine/meld'
 import { formatTile, formatTileList, formatTiles, NOTATION_LEGEND, parseTileInput, splitTokens } from '../engine/notation'
+import { formatScoreLine } from '../engine/score'
 import { tileName } from '../engine/tiles'
 import { HUMAN_SEAT, useGameStore, type ClaimPrompt, type KongPrompt } from '../stores/game'
 import StatsPanel from './StatsPanel.vue'
@@ -20,7 +21,8 @@ const opponentSummary = computed(() =>
     .map((seat) => {
       const player = store.state.players[seat]
       const melds = player.melds.length > 0 ? `[${meldText(player.melds)}]` : ''
-      return `${store.relativeLabel(seat)}${player.hand.length}张${melds}`
+      const mark = store.isDealer(seat) ? '庄' : ''
+      return `${mark}${store.relativeLabel(seat)}${player.hand.length}张${melds}`
     })
     .join('  '),
 )
@@ -37,21 +39,28 @@ const input = ref('')
 const logEl = ref<HTMLElement | null>(null)
 const pendingDiscard = ref<number | null>(null)
 const statsOpen = ref(false)
+/** 左右键选定的牌：上下切到动作文本后命令行不再含牌名，故须独立保存 */
+const selectedTile = ref<number | null>(null)
 
 const canPick = computed(() => store.canDiscard)
 
 /**
  * 命令行当前指向的牌：出牌时是那一张，响应「吃 3筒 4筒」时是所点名的两张。
- * 「碰 / 胡」不带牌张，指向牌河里那张。
+ * 「碰 / 胡」不带牌张，指向牌河里那张；动作项（打出 / 过 / 帮助…）也不带牌名，
+ * 此时回退到左右键选定的那张，动手前后都不丢选牌。
  */
 const pickedTiles = computed<number[]>(() => {
   const text = input.value.trim()
   if (!text) return []
   const prompt = store.claimPrompt
   if (prompt && ['碰', '胡'].includes(text)) return [prompt.tile]
-  return splitTokens(text.replace(/^(暗杠|加杠|吃|碰|杠)/, ''))
+  const named = splitTokens(text.replace(/^(暗杠|加杠|吃|碰|杠)/, ''))
     .map((token) => parseTileInput(token))
     .filter((tile): tile is number => tile !== null)
+  if (named.length > 0) return named
+  // 响应期间不选牌，连带不点亮上一次的选牌，避免看起来还能改牌
+  if (isResponding()) return []
+  return selectedTile.value === null ? [] : [selectedTile.value]
 })
 
 /** 手牌顺序：新摸的牌单独排到末尾，与已理顺的牌分开 */
@@ -155,6 +164,12 @@ const ADVICE_CMD = '查看建议'
 const READY_CMD = '听牌'
 const CANCEL_READY_CMD = '取消听牌'
 
+/** 响应与对局控制命令 */
+const PASS_CMD = '过'
+const HELP_CMD = '帮助'
+const RESTART_CMD = '重开'
+const QUIT_CMD = '退出'
+
 /**
  * 滚到日志末行。常规下日志区自身是滚动容器；窗口过矮时改由外层页面承担滚动，
  * 只滚日志区末行仍会留在视口外，故两层都要滚。
@@ -205,13 +220,6 @@ function seatLabel(seat: number): string {
   return seat === HUMAN_SEAT ? '你' : store.relativeLabel(seat)
 }
 
-function meldVerb(kind: string): string {
-  if (kind === MELD_KIND.CHOW) return '吃'
-  if (kind === MELD_KIND.PONG) return '碰'
-  if (kind === MELD_KIND.AN_KONG) return '暗杠'
-  return '杠'
-}
-
 function syncBoard(): void {
   const next = captureBoard()
 
@@ -220,7 +228,7 @@ function syncBoard(): void {
     const melds = store.state.players[seat].melds
     const meld = melds[melds.length - 1]
     if (meld) {
-      push(seat === HUMAN_SEAT ? 'action' : 'info', `${seatLabel(seat)} ${meldVerb(meld.kind)} [${formatTileList(meld.tiles)}]`)
+      push(seat === HUMAN_SEAT ? 'action' : 'info', `${seatLabel(seat)} ${meldKindLabel(meld.kind)} [${formatTileList(meld.tiles)}]`)
     }
   }
 
@@ -241,25 +249,19 @@ function syncBoard(): void {
 
 function meldText(melds: readonly Meld[]): string {
   if (melds.length === 0) return '无'
-  return melds
-    .map((meld) => {
-      const tag =
-        meld.kind === MELD_KIND.CHOW
-          ? '吃'
-          : meld.kind === MELD_KIND.PONG
-            ? '碰'
-            : meld.kind === MELD_KIND.AN_KONG
-              ? '暗杠'
-              : '杠'
-      return `${tag}[${formatTileList(meld.tiles)}]`
-    })
-    .join(' ')
+  return melds.map((meld) => `${meldKindLabel(meld.kind)}[${formatTileList(meld.tiles)}]`).join(' ')
 }
 
 function printSituation(): void {
   // 手牌与对手概况常驻顶部状态栏，四家动向由 syncBoard 实时记录，这里只标出轮次
   divider()
-  push('info', `轮到你 · 剩余 ${store.wallLeft} 张 · 第 ${store.human.discards.length + 1} 手`)
+  const dealer = `庄家 ${store.seatName(store.dealer)}${
+    store.dealerStreak > 0 ? `（连庄 ${store.dealerStreak} 次）` : ''
+  }`
+  push(
+    'info',
+    `轮到你 · 剩余 ${store.wallLeft} 张 · 第 ${store.human.discards.length + 1} 手 · ${dealer}`,
+  )
   if (store.human.declaredReady) {
     push(
       'hint',
@@ -278,15 +280,19 @@ function printHelp(): void {
   divider()
   push('info', '命令列表')
   push('info', '  <牌名>        打出该牌，如「5万」「五万」「东」（也支持 5m / 5M 写法）')
+  push('info', '  ←→            出牌时在可打出的牌之间切换并点亮手牌')
+  push('info', `  ↑↓            在可用动作之间切换（${DISCARD_CMD} / ${ADVICE_CMD} / 吃碰杠胡 / ${PASS_CMD} / ${HELP_CMD}…）`)
+  push('info', '  响应期间左右与上下都只切换响应项，此时不能选牌')
   push('info', '  建议 / t      列出每张可打牌的胜率与理由')
+  push('info', `  ${ADVICE_CMD}      查看选中牌与其余候选的胜率对比`)
   push('info', '  分析 下家     查看某家牌型推断（下家 / 对家 / 上家）')
   push('info', '  碰 吃 杠 胡   响应他家打出的牌')
   push('info', '  过 / pass     放弃响应')
   push('info', `  ${READY_CMD}          报听：锁死手牌，此后摸打自动胡牌（仅已听牌时可用）`)
   push('info', `  ${CANCEL_READY_CMD}      撤销报听（仅限下一次自己出牌之前）`)
   push('info', '  手牌 / h      重新显示手牌')
-  push('info', '  重开          重开一局')
-  push('info', '  退出          返回图形界面')
+  push('info', `  ${RESTART_CMD}          重开一局`)
+  push('info', `  ${QUIT_CMD}          返回图形界面`)
   push('dim', `  ${NOTATION_LEGEND}`)
   push('dim', '  手牌末尾带下划线的是刚摸到的牌；绿色为可打出，灰色受有风跟打限制')
   divider()
@@ -378,22 +384,20 @@ function printResult(): void {
   const result = store.state.result
   if (!result) return
   divider()
-  if (result.draw) {
+  const record = result.winners[0]
+  if (!record) {
     push('hint', '流局，本局无人胡牌')
   } else {
-    const record = result.winners[0]
-    if (record) {
-      const who = record.seat === HUMAN_SEAT ? '你' : store.relativeLabel(record.seat)
-      const detail = record.from === null ? '自摸' : `放炮者 ${store.relativeLabel(record.from)}`
-      push('hint', `${who} 胡牌（${detail}）：${tileName(record.tile)}`)
-      push('info', `${record.score.labels.join(' · ')} | ${record.score.hard ? '硬牌' : '软牌'} ${record.score.multiplier}倍 | 合计 ${record.score.total}`)
-    }
+    const who = record.seat === HUMAN_SEAT ? '你' : store.relativeLabel(record.seat)
+    const detail = record.from === null ? '自摸' : `放炮者 ${store.relativeLabel(record.from)}`
+    push('hint', `${who} 胡牌（${detail}）：${tileName(record.tile)}`)
+    push('info', formatScoreLine(record.score))
   }
+  if (store.settlementText) push('info', `四家分值 ${store.settlementText}`)
   push('dim', '输入「重开」再来一局')
 }
 
 function printClaims(prompt: ClaimPrompt): void {
-  cursor.value = 0
   const kinds = prompt.options.map((option) =>
     option.kind === 'chow'
       ? `吃(${formatTileList(option.tiles ?? [])})`
@@ -469,7 +473,7 @@ function handleClaim(raw: string): void {
     return
   }
 
-  if (['过', 'pass', 'p', '不要'].includes(command)) {
+  if ([PASS_CMD, 'pass', 'p', '不要'].includes(command)) {
     store.answerClaim(false)
     push('action', '你选择过')
     return
@@ -515,6 +519,8 @@ function submit(): void {
   if (statsOpen.value) return
   const raw = input.value.trim()
   if (!raw) return
+  // 选中的牌由命令行文本反推，必须在清空命令行之前取出
+  const selected = pickedTiles.value[0]
   push('input', `> ${raw}`)
   input.value = ''
 
@@ -528,7 +534,7 @@ function submit(): void {
     return
   }
   if (store.kongPrompt) {
-    if (['过', 'pass', 'p'].includes(raw.toLowerCase())) {
+    if ([PASS_CMD, 'pass', 'p'].includes(raw.toLowerCase())) {
       store.answerKong(null)
       push('action', '你选择过')
       return
@@ -548,15 +554,22 @@ function submit(): void {
   }
 
   const command = raw.toLowerCase()
-  if (pendingDiscard.value !== null) {
-    if (raw === DISCARD_CMD) {
+  if (raw === DISCARD_CMD) {
+    if (pendingDiscard.value !== null) {
       confirmDiscard()
       return
     }
-    if (raw === ADVICE_CMD) {
-      printComparison(pendingDiscard.value)
+    if (selected === undefined) {
+      push('error', `先用 ←→ 选中一张牌，再输入「${DISCARD_CMD}」`)
       return
     }
+    void tryDiscard(selected)
+    return
+  }
+  if (raw === ADVICE_CMD) {
+    if (pendingDiscard.value !== null) printComparison(pendingDiscard.value)
+    else printAdvice()
+    return
   }
   if (raw === CANCEL_READY_CMD) {
     if (!store.canCancelReady) {
@@ -567,15 +580,15 @@ function submit(): void {
     push('action', '你已取消报听')
     return
   }
-  if (['帮助', 'help', '?'].includes(command)) return printHelp()
-  if (['重开', 'restart', 'r'].includes(command)) {
+  if ([HELP_CMD, 'help', '?'].includes(command)) return printHelp()
+  if ([RESTART_CMD, 'restart', 'r'].includes(command)) {
     lines.value = []
     board = { meldSignatures: [], lastDiscard: null, lastDiscardSeat: null }
     pendingDiscard.value = null
     void store.start()
     return
   }
-  if (['退出', 'exit', 'q'].includes(command)) {
+  if ([QUIT_CMD, 'exit', 'q'].includes(command)) {
     exitPlain()
     return
   }
@@ -609,24 +622,21 @@ function claimVerb(kind: string): string {
 }
 
 /** 可打出的牌名，刚摸的那张排最前——它是每次摸牌后的默认选中项 */
-function legalTileNames(): string[] {
+/** 可打出的牌，刚摸的那张排在最前 */
+function legalTileOrder(): number[] {
   const tiles = [...store.legalTiles]
   const drawn = store.human.drawnTile
-  if (drawn === null || !store.legalTiles.has(drawn)) return tiles.map((tile) => tileName(tile))
-  return [drawn, ...tiles.filter((tile) => tile !== drawn)].map((tile) => tileName(tile))
+  if (drawn === null || !store.legalTiles.has(drawn)) return tiles
+  return [drawn, ...tiles.filter((tile) => tile !== drawn)]
 }
 
 /**
- * 方向键当前可循环的命令：处于响应状态时给出响应选项，否则给出可打出的牌。
+ * 上下键可循环的动作项：按当前处境列出可用动作，帮助始终在列。
+ * 牌名不在此列——选牌由左右键负责，两者职责正交。
  */
-function navigableCommands(): string[] {
-  // 对局结束后只剩重开与退出可选，继续列手牌会让人以为还能打
-  if (store.state.result) return ['重开', '退出']
-
-  // 待确认态：确认与看对比排最前便于立即选中，其后保留选牌以便改打
-  if (pendingDiscard.value !== null) {
-    return [DISCARD_CMD, ADVICE_CMD, ...legalTileNames()]
-  }
+function navigableActions(): string[] {
+  // 对局结束后只剩重开与退出可选，继续列动作会让人以为还能打
+  if (store.state.result) return [RESTART_CMD, QUIT_CMD, HELP_CMD]
 
   const claim = store.claimPrompt
   if (claim) {
@@ -637,7 +647,7 @@ function navigableCommands(): string[] {
         : claimVerb(option.kind),
     )
     if (claim.canDeclareReady) commands.push(READY_CMD)
-    return [...commands, '过']
+    return [...commands, PASS_CMD, HELP_CMD]
   }
 
   const kong = store.kongPrompt
@@ -645,34 +655,58 @@ function navigableCommands(): string[] {
     return [
       ...kong.anKongs.map((tile) => `杠 ${tileName(tile)}`),
       ...kong.addKongs.map((tile) => `杠 ${tileName(tile)}`),
-      '过',
+      PASS_CMD,
+      HELP_CMD,
     ]
   }
-  if (store.selfWinPrompt) return ['胡', '过']
-  return legalTileNames()
+  if (store.selfWinPrompt) return ['胡', PASS_CMD, HELP_CMD]
+  return [DISCARD_CMD, ADVICE_CMD, HELP_CMD]
 }
 
-/** 输入框内用方向键在可选项之间循环，直接把命令填进命令行 */
+/** 响应期间无可选的牌，此时按键一律只操作响应项 */
+function isResponding(): boolean {
+  return store.claimPrompt !== null || store.kongPrompt !== null || store.selfWinPrompt
+}
+
+/** 进入响应或提示态时把第一个可选项填进命令行，省去先按一次方向键 */
+function primeAction(): void {
+  const actions = navigableActions()
+  cursor.value = 0
+  input.value = actions[0] ?? ''
+  // 全选住，直接输入别的命令即可覆盖，不必先清空
+  void nextTick(() => inputEl.value?.select())
+}
+
+/** 输入框内用方向键操作：响应期间左右与上下都只切响应项，否则左右选牌、上下切动作 */
 function onInputKeydown(event: KeyboardEvent): void {
   if (statsOpen.value) return
-  const commands = navigableCommands()
-  if (commands.length === 0) return
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+  const isNext = event.key === 'ArrowRight' || event.key === 'ArrowDown'
+  const isPrev = event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+  if (!isNext && !isPrev) return
+  const step = isNext ? 1 : -1
+
+  const vertical = event.key === 'ArrowUp' || event.key === 'ArrowDown'
+  if (isResponding() || vertical) {
+    const actions = navigableActions()
+    if (actions.length === 0) return
     event.preventDefault()
-    cursor.value = cursor.value <= 0 ? commands.length - 1 : cursor.value - 1
-    input.value = commands[cursor.value] ?? commands[0]
+    cursor.value = (cursor.value + step + actions.length) % actions.length
+    input.value = actions[cursor.value] ?? actions[0]
     return
   }
-  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
-    event.preventDefault()
-    cursor.value = (cursor.value + 1) % commands.length
-    input.value = commands[cursor.value] ?? commands[0]
-  }
+
+  const tiles = legalTileOrder()
+  if (tiles.length === 0) return
+  event.preventDefault()
+  cursor.value = (cursor.value + step + tiles.length) % tiles.length
+  const tile = tiles[cursor.value] ?? tiles[0]
+  input.value = tileName(tile)
+  selectedTile.value = tile
 }
 
 onMounted(() => {
   push('dim', `${NOTATION_LEGEND}`)
-  push('info', '摸鱼模式已开启。输入「帮助」查看命令，←→ 键选牌（选中的牌会在手牌中点亮）。')
+  push('info', `摸鱼模式已开启。输入「${HELP_CMD}」查看命令；←→ 选牌、↑↓ 切动作（响应时只切响应项），回车执行。`)
   board = captureBoard()
   if (store.canDiscard) printSituation()
   focusInput()
@@ -696,8 +730,10 @@ watch(
     cursor.value = 0
     // 刚摸的那张作为默认选中：填进命令行让手牌同步点亮，直接回车即可打出
     const drawn = store.human.drawnTile
-    if (drawn === null || !store.legalTiles.has(drawn)) return
-    input.value = tileName(drawn)
+    const usable = drawn !== null && store.legalTiles.has(drawn) ? drawn : null
+    selectedTile.value = usable
+    if (usable === null) return
+    input.value = tileName(usable)
     // 全选住，直接输入别的牌名即可覆盖，不必先清空
     void nextTick(() => inputEl.value?.select())
   },
@@ -706,21 +742,27 @@ watch(
 watch(
   () => store.claimPrompt,
   (prompt) => {
-    if (prompt) printClaims(prompt)
+    if (!prompt) return
+    printClaims(prompt)
+    primeAction()
   },
 )
 
 watch(
   () => store.kongPrompt,
   (prompt) => {
-    if (prompt) printKongs(prompt)
+    if (!prompt) return
+    printKongs(prompt)
+    primeAction()
   },
 )
 
 watch(
   () => store.selfWinPrompt,
   (active) => {
-    if (active) push('hint', '可以自摸胡牌：输入「胡」或「过」')
+    if (!active) return
+    push('hint', '可以自摸胡牌：输入「胡」或「过」')
+    primeAction()
   },
 )
 
@@ -795,7 +837,7 @@ watch(
             type="text"
             autocomplete="off"
             spellcheck="false"
-            placeholder="输入牌名出牌，←→ 键选牌，或输入「帮助」"
+            :placeholder="`输入牌名出牌，←→ 选牌，↑↓ 切动作，或输入「${HELP_CMD}」`"
             @keydown="onInputKeydown"
             @keydown.enter="submit"
           />

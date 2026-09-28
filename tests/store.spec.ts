@@ -1,6 +1,10 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it } from 'vitest'
+import { WHITE_DRAGON } from '../src/engine/tiles'
 import { HUMAN_SEAT, useGameStore } from '../src/stores/game'
+
+/** 筒2–筒8：对 筒4 / 筒5 / 筒6 都能吃出 2 种以上组合 */
+const CHOW_FRIENDLY_HAND = [10, 11, 12, 13, 14, 15, 16]
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -74,6 +78,53 @@ describe('对局编排', { timeout: 20000 }, () => {
 
     expect(store.human.hand.length).toBe(handBefore - 1)
     expect(store.state.lastDiscardSeat).toBe(HUMAN_SEAT)
+    store.reset()
+  })
+
+  it('同一张打牌有多个响应组合时，玩家只被询问一次', async () => {
+    const store = useGameStore()
+    void store.start()
+    await waitUntil(() => store.canDiscard)
+
+    const game = store.state
+    // 财神固定为白板，下面所有手牌都不含它，避免万能牌扰动手牌结构
+    game.jokerTile = WHITE_DRAGON
+
+    // 其余补互不成对的散牌，避免人类自己先形成响应
+    const human = game.players[HUMAN_SEAT]
+    human.hand = [...CHOW_FRIENDLY_HAND, 0, 1, 3, 4, 6, 7, 18, 21, 24]
+    human.melds = []
+
+    // 上家（座位 3）只留筒4/5/6：无论它打哪张，人类都能吃出多种组合。
+    // 另两家只留字牌：既抢不走这张牌，其自身弃牌也不会被人类吃碰。
+    const upper = game.players[3]
+    upper.hand = [13, 14, 15]
+    upper.melds = []
+    game.players[1].hand = [29, 30]
+    game.players[1].melds = []
+    game.players[2].hand = [32, 28]
+    game.players[2].melds = []
+
+    // 人类先手（庄家）打牌后依次轮到座位 1、2、3 各摸一张，位置因此固定
+    game.wall[game.wallCursor] = 31
+    game.wall[game.wallCursor + 1] = 27
+    game.wall[game.wallCursor + 2] = 15
+
+    const seqBefore = store.turnSeq
+    store.commitDiscard(0)
+    await waitUntil(() => store.claimPrompt !== null)
+
+    const prompt = store.claimPrompt
+    expect(prompt).not.toBeNull()
+    // 场景有效性：玩家确有多条响应组合，否则本用例无法暴露「反复询问」
+    expect(prompt?.options.length ?? 0).toBeGreaterThan(1)
+
+    store.answerClaim(false)
+    // 两种结局都要立刻退出等待：正常轮到人类下一次出牌，或同一张牌再次弹出询问
+    await waitUntil(() => store.claimPrompt !== null || store.turnSeq > seqBefore)
+
+    expect(store.claimPrompt).toBeNull()
+    expect(store.turnSeq).toBeGreaterThan(seqBefore)
     store.reset()
   })
 })

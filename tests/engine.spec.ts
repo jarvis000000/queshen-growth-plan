@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { sortHand } from '../src/engine/game'
+import { applyChow, createGame, sortHand } from '../src/engine/game'
 import { normalize } from '../src/engine/joker'
+import { collectSupport, countSupport, findChowOptions } from '../src/engine/meld'
 import { legalDiscards, nextFollowHonor } from '../src/engine/rules'
 import { calcShanten } from '../src/engine/shanten'
 import { toCounts } from '../src/engine/tiles'
@@ -271,5 +272,43 @@ describe('有风跟打与财神', () => {
 
   it('数牌结尾时跟打约束解除', () => {
     expect(nextFollowHonor(m(1), EAST, [m(1), m(2)])).toBeNull()
+  })
+})
+
+describe('财神与白板的取牌优先级', () => {
+  // 财神为筒5：白板等效筒5 本色，财神牌则是万能牌，故需要筒5 时应先花白板
+  const JOKER = p(5)
+
+  it('吃财神本色的搭子时取白板，不花掉财神牌', () => {
+    const hand = [WHITE, p(5), p(6)]
+    expect(findChowOptions(hand, p(4), JOKER)).toEqual([[WHITE, p(6)]])
+  })
+
+  it('碰财神本色时先用白板，不足才花财神牌', () => {
+    const hand = [WHITE, p(5), p(5)]
+    expect(collectSupport(hand, p(5), JOKER, 2)).toEqual([WHITE, p(5)])
+  })
+
+  it('财神本色正是白板时没有替身，只能花财神牌', () => {
+    const hand = [WHITE, WHITE]
+    expect(collectSupport(hand, WHITE, WHITE, 2)).toEqual([WHITE, WHITE])
+  })
+
+  it('需要非财神本色时白板不参与', () => {
+    const hand = [WHITE, p(6)]
+    expect(collectSupport(hand, p(6), JOKER, 2)).toEqual([p(6)])
+    expect(countSupport(hand, p(6), JOKER)).toBe(1)
+  })
+
+  it('吃成立后副露里放的是白板，财神牌留在手牌', () => {
+    const state = createGame(() => 0.5, 0)
+    state.jokerTile = JOKER
+    state.players[1].hand = [WHITE, p(5), p(6), m(1)]
+    state.pending = { tile: p(4), from: 0 }
+    const combo = findChowOptions(state.players[1].hand, p(4), JOKER)[0]
+
+    expect(applyChow(state, 1, combo ?? [])).toBe(true)
+    expect(state.players[1].melds[0]?.tiles).toContain(WHITE)
+    expect(state.players[1].hand).toContain(p(5))
   })
 })
