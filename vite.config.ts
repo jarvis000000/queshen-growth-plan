@@ -34,6 +34,8 @@ function emptyOutDirFallback(): Plugin {
 }
 
 export default defineConfig({
+  // 相对 base：同一份产物既能放域名根目录，也能放 GitHub Pages 的 /<仓库名>/ 子路径
+  base: './',
   plugins: [vue(), emptyOutDirFallback()],
   resolve: {
     alias: {
