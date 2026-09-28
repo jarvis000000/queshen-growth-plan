@@ -3,7 +3,9 @@ import { nextTick } from 'vue'
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
   applyAnKong,
+  applyDiscard,
   applyKong,
+  applyPong,
   createGame,
   settleDraw,
   settleWin,
@@ -232,6 +234,98 @@ describe('财神分', () => {
   })
 })
 
+describe('四连跟打罚分', () => {
+  const EAST = 27
+  const SOUTH = 28
+  const M1 = 0
+
+  /** 四家暗牌清空，便于逐张安排出牌 */
+  function chainState(dealerStreak = 0): GameState {
+    const state = createGame(() => 0.5, 0, dealerStreak)
+    state.jokerTile = JOKER
+    for (const player of state.players) {
+      player.hand = []
+      player.melds = []
+    }
+    return state
+  }
+
+  /** 让指定座位打出某张牌：手牌只留这一张，避免受手牌结构干扰 */
+  function discard(state: GameState, seat: number, tile: number): void {
+    state.players[seat].hand = [tile]
+    applyDiscard(state, seat, tile)
+  }
+
+  function total(state: GameState): number {
+    return state.instantPoints.reduce((sum, value) => sum + value, 0)
+  }
+
+  it('同一字牌连续打出四张：首张出牌者付三份，其余三家各得一份', () => {
+    const state = chainState()
+    for (let seat = 0; seat < 4; seat++) discard(state, seat, EAST)
+    expect(state.instantPoints).toEqual([-3, 1, 1, 1])
+    expect(total(state)).toBe(0)
+  })
+
+  it('只打出三张不触发', () => {
+    const state = chainState()
+    for (let seat = 0; seat < 3; seat++) discard(state, seat, EAST)
+    expect(state.instantPoints).toEqual([0, 0, 0, 0])
+  })
+
+  it('中途换成另一种字牌则链条重起', () => {
+    const state = chainState()
+    discard(state, 0, EAST)
+    discard(state, 1, EAST)
+    discard(state, 2, SOUTH)
+    discard(state, 3, EAST)
+    expect(state.instantPoints).toEqual([0, 0, 0, 0])
+  })
+
+  it('中途打出数牌则链条断开', () => {
+    const state = chainState()
+    discard(state, 0, EAST)
+    discard(state, 1, EAST)
+    discard(state, 2, M1)
+    discard(state, 3, EAST)
+    expect(state.instantPoints).toEqual([0, 0, 0, 0])
+  })
+
+  it('牌被碰走时链条断开', () => {
+    const state = chainState()
+    discard(state, 0, EAST)
+    discard(state, 1, EAST)
+    state.players[2].hand = [EAST, EAST]
+    state.pending = { tile: EAST, from: 1 }
+    applyPong(state, 2)
+    discard(state, 3, EAST)
+    discard(state, 0, EAST)
+    expect(state.instantPoints).toEqual([0, 0, 0, 0])
+  })
+
+  it('结算后链条重起，再连打四张可再次触发', () => {
+    const state = chainState()
+    for (let seat = 0; seat < 4; seat++) discard(state, seat, EAST)
+    for (let seat = 3; seat >= 0; seat--) discard(state, seat, EAST)
+    // 第二轮起点是座位 3，故由它承担罚分
+    expect(state.instantPoints).toEqual([-2, 2, 2, -2])
+    expect(total(state)).toBe(0)
+  })
+
+  it('罚分是固定值，不随连庄倍数放大', () => {
+    const state = chainState(4)
+    for (let seat = 0; seat < 4; seat++) discard(state, seat, EAST)
+    expect(state.instantPoints).toEqual([-3, 1, 1, 1])
+  })
+
+  it('流局时罚分照常并入四家净变化', () => {
+    const state = chainState()
+    for (let seat = 0; seat < 4; seat++) discard(state, seat, EAST)
+    settleDraw(state)
+    expect(deltasOf(state)).toEqual([-3, 1, 1, 1])
+  })
+})
+
 describe('杠分', () => {
   function kongState(dealer = 0, dealerStreak = 0): GameState {
     const state = createGame(() => 0.5, dealer, dealerStreak)
@@ -248,14 +342,14 @@ describe('杠分', () => {
     state.players[1].hand = [5, 5, 5, 0, 1, 2]
     state.pending = { tile: 5, from: 0 }
     expect(applyKong(state, 1)).not.toBeNull()
-    expect(state.kongPoints).toEqual([-1, 3, -1, -1])
+    expect(state.instantPoints).toEqual([-1, 3, -1, -1])
   })
 
   it('暗杠：其他三家各付两份，杠家得六份', () => {
     const state = kongState()
     state.players[2].hand = [7, 7, 7, 7, 0, 1, 2]
     expect(applyAnKong(state, 2, 7)).not.toBeNull()
-    expect(state.kongPoints).toEqual([-2, -2, 6, -2])
+    expect(state.instantPoints).toEqual([-2, -2, 6, -2])
   })
 
   it('杠分是固定值，不随连庄倍数放大', () => {
@@ -263,7 +357,7 @@ describe('杠分', () => {
     state.players[1].hand = [5, 5, 5]
     state.pending = { tile: 5, from: 0 }
     applyKong(state, 1)
-    expect(state.kongPoints).toEqual([-1, 3, -1, -1])
+    expect(state.instantPoints).toEqual([-1, 3, -1, -1])
   })
 
   it('流局把已结算的杠分与财神分一并并入四家净变化', () => {

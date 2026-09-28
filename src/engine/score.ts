@@ -40,6 +40,8 @@ export const UNIT = {
   JOKER: 1,
   EXPOSED_KONG: 1,
   CONCEALED_KONG: 2,
+  /** 四连跟打：首个打出者共付三份，由其余三家均分 */
+  FOLLOW_CHAIN: 3,
 } as const
 
 /** 把份数折算为实际分 */

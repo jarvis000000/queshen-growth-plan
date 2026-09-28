@@ -273,6 +273,18 @@ describe('有风跟打与财神', () => {
   it('数牌结尾时跟打约束解除', () => {
     expect(nextFollowHonor(m(1), EAST, [m(1), m(2)])).toBeNull()
   })
+
+  it('白板等效数牌时，牌河末张白板不触发跟打', () => {
+    expect(nextFollowHonor(WHITE, m(1), [WHITE, m(2)])).toBeNull()
+  })
+
+  it('白板等效字牌时仍须跟打，且跟打的是牌河那张白板', () => {
+    expect(nextFollowHonor(WHITE, EAST, [WHITE, m(2)])).toBe(WHITE)
+  })
+
+  it('财神为白板时，白板本身不构成跟打目标', () => {
+    expect(nextFollowHonor(WHITE, WHITE, [WHITE, m(2)])).toBeNull()
+  })
 })
 
 describe('财神与白板的取牌优先级', () => {

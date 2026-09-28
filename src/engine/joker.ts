@@ -41,9 +41,9 @@ export function foldTile(tile: number, jokerTile: number): { tile: number; wildc
 }
 
 /**
- * 手牌排序用的归位值：白板按其等效的财神原牌归位，
- * 使其与本色牌排在一起，而不是落到字牌堆末尾。
+ * 白板的等效牌：非财神局面下白板即财神原牌，其余牌为本色值。
+ * 排序与跟打判定都按此口径，故白板不会落到字牌堆末尾。
  */
-export function handSortValue(tile: number, jokerTile: number): number {
+export function effectiveTile(tile: number, jokerTile: number): number {
   return whiteActsAsJokerTile(jokerTile) && tile === WHITE_DRAGON ? jokerTile : tile
 }

@@ -1,4 +1,4 @@
-import { handSortValue, normalize } from './joker'
+import { effectiveTile, normalize } from './joker'
 import {
   ADD_KONG_TILES,
   AN_KONG_TILES,
@@ -16,7 +16,7 @@ import {
 } from './meld'
 import { nextFollowHonor } from './rules'
 import { scoreWin, shareScore, UNIT, type ScoreResult } from './score'
-import { createWall, shuffle } from './tiles'
+import { createWall, isHonor, shuffle } from './tiles'
 import { createSeenCounter } from './ukeire'
 import { shantenCached } from './shanten'
 import { detectWinType, type WinType } from './win'
@@ -57,7 +57,7 @@ export interface WinRecord {
 export interface GameResult {
   draw: boolean
   winners: WinRecord[]
-  /** 四家本局净变化，含杠分与放炮罚分；恒为零和 */
+  /** 四家本局净变化，含杠分、跟打罚分与放炮罚分；恒为零和 */
   deltas: number[]
 }
 
@@ -70,8 +70,8 @@ export interface GameState {
   dealer: number
   /** 当前连庄次数，0 表示未连庄；得分按 ×2ⁿ 放大 */
   dealerStreak: number
-  /** 本局各家累计杠分，局末并入 deltas */
-  kongPoints: number[]
+  /** 本局各家累计的即时固定分（杠分、四连跟打罚分），局末并入 deltas */
+  instantPoints: number[]
   turn: number
   /** 待响应的打牌；null 表示当前处于摸牌阶段 */
   pending: PendingDiscard | null
@@ -79,6 +79,11 @@ export interface GameState {
   lastDiscard: number | null
   /** 打出 lastDiscard 的座位，与 lastDiscard 成对更新，不随回合推进而改变 */
   lastDiscardSeat: number | null
+  /**
+   * 牌河上连续同种字牌的进度：key 为等效牌种，starter 为连打起点即首张的出牌者。
+   * 满四张时结算跟打罚分并清空；牌被吃碰杠拿走时同样清空。
+   */
+  followChain: { key: number; count: number; starter: number } | null
   result: GameResult | null
 }
 
@@ -105,7 +110,7 @@ function emptyPlayer(seat: number): PlayerState {
 
 /** 按归位值理牌：白板跟随财神原牌归位，其余按本色牌值 */
 export function sortHand(hand: number[], jokerTile: number): number[] {
-  return hand.sort((a, b) => handSortValue(a, jokerTile) - handSortValue(b, jokerTile))
+  return hand.sort((a, b) => effectiveTile(a, jokerTile) - effectiveTile(b, jokerTile))
 }
 
 export function createGame(random: () => number = Math.random, dealer = 0, dealerStreak = 0): GameState {
@@ -127,11 +132,12 @@ export function createGame(random: () => number = Math.random, dealer = 0, deale
     jokerTile,
     dealer,
     dealerStreak,
-    kongPoints: Array.from({ length: SEATS }, () => 0),
+    instantPoints: Array.from({ length: SEATS }, () => 0),
     turn: dealer,
     pending: null,
     lastDiscard: null,
     lastDiscardSeat: null,
+    followChain: null,
     result: null,
   }
 }
@@ -149,7 +155,7 @@ export function drawTile(state: GameState, seat: number): number | null {
   const tile = state.wall[state.wallCursor++]
   const player = state.players[seat]
   const insertAt = player.hand.findIndex(
-    (held) => handSortValue(held, state.jokerTile) > handSortValue(tile, state.jokerTile),
+    (held) => effectiveTile(held, state.jokerTile) > effectiveTile(tile, state.jokerTile),
   )
   player.hand.splice(insertAt === -1 ? player.hand.length : insertAt, 0, tile)
   player.drawnTile = tile
@@ -167,7 +173,29 @@ export function applyDiscard(state: GameState, seat: number, tile: number): bool
   state.lastDiscardSeat = seat
   state.pending = { tile, from: seat }
   state.turn = seat
+  advanceFollowChain(state, seat, tile)
   return true
+}
+
+/**
+ * 四连跟打：同一种字牌连续被打出四张时，首张的出牌者向其余三家各赔一份。
+ * 与是否受跟打规则强制无关 —— 成对成刻主动拆打、刚摸到直接打出同样计入。
+ */
+function advanceFollowChain(state: GameState, seat: number, tile: number): void {
+  const key = effectiveTile(tile, state.jokerTile)
+  if (!isHonor(key)) {
+    state.followChain = null
+    return
+  }
+  const chain = state.followChain
+  if (chain?.key !== key) {
+    state.followChain = { key, count: 1, starter: seat }
+    return
+  }
+  chain.count += 1
+  if (chain.count < SEATS) return
+  settleFollowChain(state, chain.starter)
+  state.followChain = null
 }
 
 export function clearPending(state: GameState): void {
@@ -263,6 +291,8 @@ function reclaimDiscard(state: GameState, from: number, tile: number): void {
   const discards = state.players[from].discards
   const index = discards.lastIndexOf(tile)
   if (index !== -1) discards.splice(index, 1)
+  // 牌河被撤走一张，连续同种字牌的链条不复成立
+  state.followChain = null
 }
 
 /**
@@ -273,8 +303,21 @@ function settleKongPoints(state: GameState, seat: number, concealed: boolean): v
   const unit = shareScore(concealed ? UNIT.CONCEALED_KONG : UNIT.EXPOSED_KONG)
   for (let other = 0; other < SEATS; other++) {
     if (other === seat) continue
-    state.kongPoints[other] -= unit
-    state.kongPoints[seat] += unit
+    state.instantPoints[other] -= unit
+    state.instantPoints[seat] += unit
+  }
+}
+
+/**
+ * 四连跟打罚分：按三家均分总额，故逐家对扣加即为零和。
+ * 与杠分同为固定分，不参与胡牌倍数。
+ */
+function settleFollowChain(state: GameState, starter: number): void {
+  const unit = shareScore(UNIT.FOLLOW_CHAIN) / (SEATS - 1)
+  for (let other = 0; other < SEATS; other++) {
+    if (other === starter) continue
+    state.instantPoints[other] += unit
+    state.instantPoints[starter] -= unit
   }
 }
 
@@ -302,7 +345,7 @@ function applyJokerPoints(
 
 /**
  * 分家结算：三家各付一份「底分 × 倍数」，点炮者额外多付一份罚分；
- * 财神分与杠分只跟底分相关、不参与倍数，三者叠加后恒为零和。
+ * 财神分与即时固定分只跟底分相关、不参与倍数，叠加后恒为零和。
  */
 function settlementOf(
   state: GameState,
@@ -310,7 +353,7 @@ function settlementOf(
   winnerTiles: readonly number[],
 ): number[] {
   const { seat, from, score } = record
-  const deltas = state.kongPoints.slice()
+  const deltas = state.instantPoints.slice()
   applyJokerPoints(state, deltas, seat, winnerTiles)
 
   const share = shareScore(score.multiplier)
@@ -442,7 +485,7 @@ export function settleWin(
 }
 
 export function settleDraw(state: GameState): void {
-  const deltas = state.kongPoints.slice()
+  const deltas = state.instantPoints.slice()
   applyJokerPoints(state, deltas, -1, [])
   state.result = { draw: true, winners: [], deltas }
   state.pending = null
