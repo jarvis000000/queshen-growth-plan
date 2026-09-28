@@ -104,21 +104,73 @@ const PIP_LAYOUTS: readonly (readonly [number, number][])[] = [
 ]
 
 const PIP_RADIUS = [0, 27, 21, 18, 17, 15.5, 13.5, 12.5, 11.5, 11]
+
+interface Stick {
+  x: number
+  y: number
+  /** 倾斜角度（度），0 为竖直；供 8 条画出斜向交叉 */
+  angle?: number
+}
+
+/**
+ * 条子按真实麻将排布：成行横排，8 条上下两行斜向相反形成交叉。
+ * 与筒子的圆点排布差异较大，故单独维护一张表。
+ */
+const TIAO_LAYOUTS: readonly (readonly Stick[])[] = [
+  [{ x: 0.5, y: 0.5 }],
+  [{ x: 0.5, y: 0.27 }, { x: 0.5, y: 0.73 }],
+  [{ x: 0.5, y: 0.24 }, { x: 0.28, y: 0.72 }, { x: 0.72, y: 0.72 }],
+  [{ x: 0.3, y: 0.28 }, { x: 0.7, y: 0.28 }, { x: 0.3, y: 0.72 }, { x: 0.7, y: 0.72 }],
+  [{ x: 0.28, y: 0.2 }, { x: 0.72, y: 0.2 }, { x: 0.5, y: 0.5 }, { x: 0.28, y: 0.8 }, { x: 0.72, y: 0.8 }],
+  [{ x: 0.22, y: 0.3 }, { x: 0.5, y: 0.3 }, { x: 0.78, y: 0.3 }, { x: 0.22, y: 0.72 }, { x: 0.5, y: 0.72 }, { x: 0.78, y: 0.72 }],
+  [
+    { x: 0.5, y: 0.14 },
+    { x: 0.24, y: 0.5 }, { x: 0.5, y: 0.5 }, { x: 0.76, y: 0.5 },
+    { x: 0.24, y: 0.84 }, { x: 0.5, y: 0.84 }, { x: 0.76, y: 0.84 },
+  ],
+  [
+    { x: 0.16, y: 0.28, angle: 32 }, { x: 0.39, y: 0.28, angle: 32 }, { x: 0.62, y: 0.28, angle: 32 }, { x: 0.85, y: 0.28, angle: 32 },
+    { x: 0.16, y: 0.72, angle: -32 }, { x: 0.39, y: 0.72, angle: -32 }, { x: 0.62, y: 0.72, angle: -32 }, { x: 0.85, y: 0.72, angle: -32 },
+  ],
+  [
+    { x: 0.24, y: 0.22 }, { x: 0.5, y: 0.22 }, { x: 0.76, y: 0.22 },
+    { x: 0.24, y: 0.5 }, { x: 0.5, y: 0.5 }, { x: 0.76, y: 0.5 },
+    { x: 0.24, y: 0.78 }, { x: 0.5, y: 0.78 }, { x: 0.76, y: 0.78 },
+  ],
+]
+
+/** 条子的宽高：列多则窄、行多则矮，避免相邻两根粘连成一片 */
+const TIAO_SIZE = [
+  { w: 16, h: 46 },
+  { w: 16, h: 30 },
+  { w: 15, h: 26 },
+  { w: 15, h: 26 },
+  { w: 14, h: 22 },
+  { w: 13, h: 32 },
+  { w: 13, h: 22 },
+  { w: 11, h: 26 },
+  { w: 13, h: 22 },
+]
+
 const CN_DIGITS = ['', '一', '二', '三', '四', '五', '六', '七', '八', '九']
 
 const face = computed(() => {
   const tile = props.tile
   if (tile >= 27) {
-    const label = HONOR_LABELS[tile - 27]
-    return { kind: 'honor' as const, label, red: tile === 31 }
+    // 白板与真实牌面一致：只留空框，不写「白」字
+    const isWhite = tile === WHITE_DRAGON
+    return {
+      kind: 'honor' as const,
+      label: isWhite ? '' : HONOR_LABELS[tile - 27],
+      red: tile === 31,
+      green: tile === 32,
+    }
   }
   const suit = suitOf(tile)
   const rank = (tile % 9) + 1
-  const pips = PIP_LAYOUTS[rank - 1]
-  const radius = PIP_RADIUS[rank]
   if (suit === 0) return { kind: 'wan' as const, rank, cn: CN_DIGITS[rank] }
-  if (suit === 1) return { kind: 'tong' as const, pips, radius }
-  return { kind: 'tiao' as const, pips, radius }
+  if (suit === 1) return { kind: 'tong' as const, pips: PIP_LAYOUTS[rank - 1], radius: PIP_RADIUS[rank] }
+  return { kind: 'tiao' as const, sticks: TIAO_LAYOUTS[rank - 1], size: TIAO_SIZE[rank - 1] }
 })
 
 const suitClass = computed(() => {
@@ -150,26 +202,28 @@ const suitClass = computed(() => {
       </svg>
 
       <svg v-else-if="face.kind === 'tiao'" class="pips" viewBox="0 0 100 100" aria-hidden="true">
-        <template v-for="(pip, index) in face.pips" :key="index">
-          <rect
-            :x="pip[0] * 100 - face.radius * 0.36"
-            :y="pip[1] * 100 - face.radius * 1.15"
-            :width="face.radius * 0.72"
-            :height="face.radius * 2.3"
-            :rx="face.radius * 0.34"
-            class="stick"
-          />
-          <rect
-            :x="pip[0] * 100 - face.radius * 0.36"
-            :y="pip[1] * 100 - face.radius * 0.16"
-            :width="face.radius * 0.72"
-            :height="face.radius * 0.32"
-            class="stick-band"
-          />
+        <template v-for="stick in face.sticks" :key="`${stick.x}-${stick.y}`">
+          <g :transform="`rotate(${stick.angle ?? 0} ${stick.x * 100} ${stick.y * 100})`">
+            <rect
+              :x="stick.x * 100 - face.size.w / 2"
+              :y="stick.y * 100 - face.size.h / 2"
+              :width="face.size.w"
+              :height="face.size.h"
+              :rx="face.size.w * 0.42"
+              class="stick"
+            />
+            <rect
+              :x="stick.x * 100 - face.size.w / 2"
+              :y="stick.y * 100 - face.size.h * 0.06"
+              :width="face.size.w"
+              :height="face.size.h * 0.16"
+              class="stick-band"
+            />
+          </g>
         </template>
       </svg>
 
-      <span v-else class="honor" :class="{ red: face.red }">{{ face.label }}</span>
+      <span v-else class="honor" :class="{ red: face.red, green: face.green }">{{ face.label }}</span>
     </span>
 
     <span v-if="joker" class="mark">财</span>
@@ -230,7 +284,7 @@ const suitClass = computed(() => {
 .wan-cn {
   font-size: 18px;
   font-weight: 800;
-  color: #1d4ed8;
+  color: #1f2937;
 }
 
 .wan-char {
@@ -256,12 +310,12 @@ const suitClass = computed(() => {
 
 .tile.suit-tong .pip-outer {
   fill: #fff;
-  stroke: #1d4ed8;
+  stroke: #166534;
   stroke-width: 7;
 }
 
 .tile.suit-tong .pip-inner {
-  fill: #1d4ed8;
+  fill: #b91c1c;
 }
 
 .tile.suit-tiao .stick {
@@ -283,20 +337,23 @@ const suitClass = computed(() => {
   color: #b91c1c;
 }
 
+.honor.green {
+  color: #15803d;
+}
+
 .small .honor {
   font-size: 17px;
 }
 
+/* 白板只画一个空框，无文字，故用尺寸而非字号撑开 */
 .tile.suit-white .honor {
-  color: #64748b;
-  font-size: 21px;
-  padding: 2px 5px;
-  border: 2px solid #64748b;
+  width: 58%;
+  height: 68%;
+  border: 2.5px solid #3f3f46;
   border-radius: 3px;
 }
 
 .small.tile.suit-white .honor {
-  font-size: 13px;
   border-width: 1.5px;
 }
 

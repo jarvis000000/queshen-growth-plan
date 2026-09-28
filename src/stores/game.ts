@@ -88,6 +88,11 @@ export interface KongPrompt {
   addKongs: number[]
 }
 
+/** 自动出牌的随机等待毫秒数：AI 与报听代打共用，避免瞬时出牌让动画与日志跳动过快 */
+function autoThinkMs(): number {
+  return 420 + Math.round(Math.random() * 320)
+}
+
 function thinkDelay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -162,15 +167,11 @@ export const useGameStore = defineStore('game', () => {
    * 文字界面据此监听会漏掉整局，故改用单调递增的计数。
    */
   const turnSeq = ref(0)
-  /** 报听时刻的已出牌张数：据此判断「下一次自己出牌之前」的取消窗口是否还开着 */
-  const readyDiscardMark = ref(-1)
   const isHumanTurn = computed(() => running.value && !state.value.result && state.value.turn === HUMAN_SEAT)
   const canDiscard = computed(() => awaitingHumanDiscard.value && !state.value.result)
   const wallLeft = computed(() => wallRemaining(state.value))
-  /** 报听可否取消：出牌张数未变即仍在「下一次自己出牌之前」 */
-  const canCancelReady = computed(
-    () => human.value.declaredReady && human.value.discards.length === readyDiscardMark.value,
-  )
+  /** 报听可否取消：对局未结束前随时可撤回，以便调整手牌 */
+  const canCancelReady = computed(() => human.value.declaredReady && !state.value.result)
   /** 本局四家净变化，双界面共用 */
   const settlementText = computed(() => {
     const deltas = state.value.result?.deltas
@@ -354,9 +355,16 @@ export const useGameStore = defineStore('game', () => {
     const game = state.value
     if (seat !== HUMAN_SEAT) {
       awaitingHumanDiscard.value = false
-      return thinkDelay(420 + Math.round(Math.random() * 320)).then(
+      return thinkDelay(autoThinkMs()).then(
         () => chooseDiscard(viewFor(game, seat), difficulty.value).tile,
       )
+    }
+    // 报听时手牌已锁死，出牌无决策空间，故由系统代打；不置 awaitingHumanDiscard
+    // 使手牌转为纯展示，免得出现「可点却来不及点」的瞬态
+    if (human.value.declaredReady && human.value.drawnTile !== null) {
+      awaitingHumanDiscard.value = false
+      const drawn = human.value.drawnTile
+      return thinkDelay(autoThinkMs()).then(() => drawn)
     }
     awaitingHumanDiscard.value = true
     turnSeq.value++
@@ -478,14 +486,14 @@ export const useGameStore = defineStore('game', () => {
     let askedHuman = false
     for (const claim of ordered) {
       if (claim.seat === HUMAN_SEAT) {
-        // 报听：胡自动成立，其余响应一律放弃（手牌已锁死）
-        if (human.value.declaredReady) {
-          if (claim.kind === 'win') return executeClaim(claim)
-          continue
-        }
         if (askedHuman) continue
+        // 报听者只保留「胡不胡」的询问，吃碰杠随锁牌一并自动放弃
+        const humanOptions = ordered.filter(
+          (item) => item.seat === HUMAN_SEAT && (!human.value.declaredReady || item.kind === 'win'),
+        )
+        if (humanOptions.length === 0) continue
         askedHuman = true
-        const accepted = await askHumanClaim(ordered)
+        const accepted = await askHumanClaim(humanOptions)
         if (accepted) return executeClaim(accepted)
         continue
       }
@@ -531,14 +539,10 @@ export const useGameStore = defineStore('game', () => {
     if (selfWinPrompt.value) answerSelfWin(false)
   }
 
-  /**
-   * 报听：锁死手牌并放弃本次响应，此后摸打自动胡牌；
-   * 取消窗口截至下一次自己出牌之前。
-   */
+  /** 报听：锁死手牌并放弃本次响应，此后摸打自动胡牌；对局未结束前可随时取消 */
   function declareReady(): void {
     if (!claimPrompt.value || !canDeclareReady(state.value, HUMAN_SEAT)) return
     human.value.declaredReady = true
-    readyDiscardMark.value = human.value.discards.length
     answerClaim(false)
   }
 
