@@ -46,6 +46,8 @@ const pendingDiscard = ref<number | null>(null)
 const statsOpen = ref(false)
 /** 左右键选定的牌：上下切到动作文本后命令行不再含牌名，故须独立保存 */
 const selectedTile = ref<number | null>(null)
+/** 待报听：出牌期候选牌多于一张时亮起待选，打出其中一张即报听 */
+const pendingReady = ref(false)
 
 const canPick = computed(() => store.canDiscard)
 
@@ -84,6 +86,7 @@ const handCards = computed(() => {
   const jokerTile = store.state.jokerTile
   const drawn = store.human.drawnTile
   const picked = pickedTiles.value
+  const candidates = pendingReady.value ? store.readyDiscards : []
   const hand = orderedHand(store.human.hand, drawn)
   return hand.map((tile, index) => ({
     text: formatTile(tile, jokerTile),
@@ -92,6 +95,7 @@ const handCards = computed(() => {
     focused: picked.includes(tile),
     // 只认末尾那张，避免同值牌被一并标记
     drawn: drawn !== null && index === hand.length - 1 && tile === drawn,
+    candidate: candidates.includes(tile),
   }))
 })
 
@@ -293,8 +297,8 @@ function printHelp(): void {
   push('info', '  分析 下家     查看某家牌型推断（下家 / 对家 / 上家）')
   push('info', '  碰 吃 杠 胡   响应他家打出的牌')
   push('info', '  过 / pass     放弃响应')
-  push('info', `  ${READY_CMD}          报听：锁死手牌，此后摸打自动胡牌（仅已听牌时可用）`)
-  push('info', `  ${CANCEL_READY_CMD}      撤销报听（仅限下一次自己出牌之前）`)
+  push('info', `  ${READY_CMD}          报听：锁死手牌，此后摸打自动胡牌（也可点手牌旁的 [听]）`)
+  push('info', `  ${CANCEL_READY_CMD}      撤销报听（对局未结束前随时可撤）`)
   push('info', '  手牌 / h      重新显示手牌')
   push('info', `  ${RESTART_CMD}          重开一局`)
   push('info', `  ${QUIT_CMD}          返回图形界面`)
@@ -408,8 +412,6 @@ function printClaims(prompt: ClaimPrompt): void {
       ? `吃(${formatTileList(option.tiles ?? [])})`
       : claimVerb(option.kind),
   )
-  // 报听只在确实听牌时出现；选了它就等于放弃本次响应
-  if (prompt.canDeclareReady) kinds.push(READY_CMD)
   push('hint', `可以响应 ${tileName(prompt.tile)}：${kinds.join(' / ')}（←→ 选择后回车，或直接输入命令）`)
 }
 
@@ -436,6 +438,15 @@ async function tryDiscard(tile: number): Promise<void> {
     const reason = follow === null ? '' : `：有风跟打，须跟打 ${tileName(follow)}`
     push('error', `${tileName(tile)} 当前不可打出${reason}`)
     return
+  }
+  // 报听待选：打出候选牌即报听，打出别的牌视为放弃本次报听
+  if (pendingReady.value) {
+    pendingReady.value = false
+    if (store.readyDiscards.includes(tile)) {
+      store.declareReady(tile)
+      push('action', `你已报听（打出 ${tileName(tile)}，此后摸打自动胡牌）`)
+      return
+    }
   }
   if (!store.settings.adviceAlert) {
     store.commitDiscard(tile)
@@ -467,16 +478,6 @@ function handleClaim(raw: string): void {
   const prompt = store.claimPrompt
   if (!prompt) return
   const command = raw.toLowerCase()
-
-  if (raw === READY_CMD) {
-    if (!prompt.canDeclareReady) {
-      push('error', `当前不可报听：需手牌已听牌且尚未报听`)
-      return
-    }
-    store.declareReady()
-    push('action', '你已报听（此后摸打自动胡牌）')
-    return
-  }
 
   if ([PASS_CMD, 'pass', 'p', '不要'].includes(command)) {
     store.answerClaim(false)
@@ -519,6 +520,45 @@ function handleClaim(raw: string): void {
   push('action', `你选择${command}`)
 }
 
+/**
+ * 听牌开关：已报听则撤销，否则报听。
+ * 出牌期须先打出一张进入听牌形态——唯一候选直接打出，多张候选亮起交方向键选。
+ */
+function toggleReady(): void {
+  if (pendingReady.value) {
+    pendingReady.value = false
+    push('action', '已取消报听选择')
+    return
+  }
+  if (store.canCancelReady) {
+    store.cancelReady()
+    push('action', '你已取消报听')
+    return
+  }
+  if (store.selfWinPrompt) {
+    push('error', '当前正等待自摸决策')
+    return
+  }
+  if (!store.canDeclareReady) {
+    push('error', '当前不可报听：手牌尚未听牌')
+    return
+  }
+  const candidates = store.readyDiscards
+  pendingDiscard.value = null
+  if (candidates.length > 1) {
+    pendingReady.value = true
+    push('hint', `报听需先打出一张：${candidates.map((tile) => tileName(tile)).join(' / ')}`)
+    return
+  }
+  // 候选为空即手牌已是听牌形态（等待/响应期），无需先打牌
+  const only: number | undefined = candidates[0]
+  store.declareReady(only)
+  push(
+    'action',
+    only === undefined ? '你已报听（此后摸打自动胡牌）' : `你已报听（打出 ${tileName(only)} 后摸打自动胡牌）`,
+  )
+}
+
 function submit(): void {
   // 战绩面板打开时命令行退居幕后，避免回车误出牌
   if (statsOpen.value) return
@@ -529,6 +569,11 @@ function submit(): void {
   push('input', `> ${raw}`)
   input.value = ''
 
+  // 听牌开关独立于响应流程，故先于响应项处理
+  if ([READY_CMD, CANCEL_READY_CMD].includes(raw)) {
+    toggleReady()
+    return
+  }
   if (store.claimPrompt) {
     handleClaim(raw)
     return
@@ -576,20 +621,12 @@ function submit(): void {
     else printAdvice()
     return
   }
-  if (raw === CANCEL_READY_CMD) {
-    if (!store.canCancelReady) {
-      push('error', '当前不可取消报听：仅限下一次自己出牌之前')
-      return
-    }
-    store.cancelReady()
-    push('action', '你已取消报听')
-    return
-  }
   if ([HELP_CMD, 'help', '?'].includes(command)) return printHelp()
   if ([RESTART_CMD, 'restart', 'r'].includes(command)) {
     lines.value = []
     board = { meldSignatures: [], lastDiscard: null, lastDiscardSeat: null }
     pendingDiscard.value = null
+    pendingReady.value = false
     void store.start()
     return
   }
@@ -626,14 +663,23 @@ function claimVerb(kind: string): string {
   return '胡'
 }
 
-/** 可打出的牌名，刚摸的那张排最前——它是每次摸牌后的默认选中项 */
-/** 可打出的牌，刚摸的那张排在最前 */
+/** 可打出的牌，刚摸的那张排在最前；待报听时只在候选之间循环 */
 function legalTileOrder(): number[] {
+  if (pendingReady.value) return [...store.readyDiscards]
   const tiles = [...store.legalTiles]
   const drawn = store.human.drawnTile
   if (drawn === null || !store.legalTiles.has(drawn)) return tiles
   return [drawn, ...tiles.filter((tile) => tile !== drawn)]
 }
+
+/** 方向键动作里的听牌开关：已报听时可取消，可报听时可开启，其余为空 */
+const readyActions = computed<string[]>(() => {
+  // 自摸决策未定时不参与，免得选中后还得先回「胡 / 过」
+  if (store.selfWinPrompt) return []
+  if (store.canCancelReady) return [CANCEL_READY_CMD]
+  if (store.canDeclareReady) return [READY_CMD]
+  return []
+})
 
 /**
  * 上下键可循环的动作项：按当前处境列出可用动作，帮助始终在列。
@@ -643,6 +689,7 @@ function navigableActions(): string[] {
   // 对局结束后只剩重开与退出可选，继续列动作会让人以为还能打
   if (store.state.result) return [RESTART_CMD, QUIT_CMD, HELP_CMD]
 
+  const ready = readyActions.value
   const claim = store.claimPrompt
   if (claim) {
     const commands = claim.options.map((option) =>
@@ -651,8 +698,7 @@ function navigableActions(): string[] {
         ? `吃 ${(option.tiles ?? []).map((tile) => tileName(tile)).join(' ')}`
         : claimVerb(option.kind),
     )
-    if (claim.canDeclareReady) commands.push(READY_CMD)
-    return [...commands, PASS_CMD, HELP_CMD]
+    return [...commands, ...ready, PASS_CMD, HELP_CMD]
   }
 
   const kong = store.kongPrompt
@@ -660,12 +706,13 @@ function navigableActions(): string[] {
     return [
       ...kong.anKongs.map((tile) => `杠 ${tileName(tile)}`),
       ...kong.addKongs.map((tile) => `杠 ${tileName(tile)}`),
+      ...ready,
       PASS_CMD,
       HELP_CMD,
     ]
   }
-  if (store.selfWinPrompt) return ['胡', PASS_CMD, HELP_CMD]
-  return [DISCARD_CMD, ADVICE_CMD, HELP_CMD]
+  if (store.selfWinPrompt) return ['胡', ...ready, PASS_CMD, HELP_CMD]
+  return [DISCARD_CMD, ADVICE_CMD, ...ready, HELP_CMD]
 }
 
 /** 响应期间无可选的牌，此时按键一律只操作响应项 */
@@ -731,6 +778,7 @@ watch(
   () => store.turnSeq,
   () => {
     if (!store.canDiscard) return
+    pendingReady.value = false
     printSituation()
     cursor.value = 0
     // 刚摸的那张作为默认选中：填进命令行让手牌同步点亮，直接回车即可打出
@@ -800,7 +848,12 @@ watch(
 
         <section class="plain-status">
           <div class="status-line">
-            <span class="label">手牌</span>
+            <span class="label">手牌<button
+              type="button"
+              class="ready-toggle"
+              :class="{ on: store.human.declaredReady || pendingReady }"
+              @click="toggleReady"
+            >[听]</button></span>
             <span class="value"><template v-for="(card, index) in handCards" :key="index"><span
               class="hand-card"
               :class="{
@@ -809,6 +862,7 @@ watch(
                 joker: card.joker,
                 focused: card.focused,
                 drawn: card.drawn,
+                candidate: card.candidate,
               }"
             >{{ card.text }}</span>{{ ' ' }}</template></span>
           </div>
@@ -970,8 +1024,25 @@ watch(
 
 .status-line .label {
   flex: none;
-  width: 52px;
+  /* 容纳「手牌[听]」，不设固定宽度会让 value 列在四行之间错位 */
+  width: 66px;
   color: #8c959f;
+}
+
+/* 听牌状态开关：灰色未报听，激活色为已锁牌 */
+.ready-toggle {
+  margin-left: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: #a8b1ba;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ready-toggle.on {
+  color: #0969da;
+  font-weight: 700;
 }
 
 .status-line .value {
@@ -1003,6 +1074,11 @@ watch(
 .hand-card.joker {
   color: #b8860b;
   font-weight: 700;
+}
+
+/* 报听候选：打出其中一张即可进入听牌；选中态另由 .focused 覆盖 */
+.hand-card.candidate {
+  outline: 1px dashed #0969da;
 }
 
 .hand-card.focused {

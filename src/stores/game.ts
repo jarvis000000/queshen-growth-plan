@@ -16,7 +16,7 @@ import {
   applyDiscard,
   applyKong,
   applyPong,
-  canDeclareReady,
+  canDeclareReady as engineCanDeclareReady,
   canWinOn,
   CLAIM_PRIORITY,
   createGame,
@@ -24,6 +24,7 @@ import {
   findClaims,
   findSelfActions,
   isDraw,
+  readyDiscards as engineReadyDiscards,
   SEAT_LABELS,
   SEATS,
   settleDraw,
@@ -172,6 +173,10 @@ export const useGameStore = defineStore('game', () => {
   const wallLeft = computed(() => wallRemaining(state.value))
   /** 报听可否取消：对局未结束前随时可撤回，以便调整手牌 */
   const canCancelReady = computed(() => human.value.declaredReady && !state.value.result)
+  /** 报听可否开启：手牌已听牌，或出牌期打出一张后即可听牌 */
+  const canDeclareReady = computed(() => engineCanDeclareReady(state.value, HUMAN_SEAT))
+  /** 报听前需先打出的候选牌；仅在等待出牌时非空 */
+  const readyDiscards = computed(() => (canDiscard.value ? engineReadyDiscards(state.value, HUMAN_SEAT) : []))
   /** 本局四家净变化，双界面共用 */
   const settlementText = computed(() => {
     const deltas = state.value.result?.deltas
@@ -443,16 +448,22 @@ export const useGameStore = defineStore('game', () => {
     return diff.significant ? 'blunder' : 'acceptable'
   }
 
-  function commitDiscard(tile: number): void {
-    if (!discardResolver || !isLegalDiscard(tile)) return
+  /** 结束出牌等待并落定所选牌；auto 为系统代打（报听先打出的那张），不计入战绩评级 */
+  function settleDiscard(tile: number, auto: boolean): void {
     const resolve = discardResolver
+    if (!resolve) return
+    // 评级须在清空建议前完成
+    if (!auto) recordDiscard(rateDiscard(tile))
     discardResolver = null
     awaitingHumanDiscard.value = false
-    // 评级须在清空建议前完成
-    recordDiscard(rateDiscard(tile))
     advice.value = null
     advicePending.value = false
     resolve(tile)
+  }
+
+  function commitDiscard(tile: number): void {
+    if (!discardResolver || !isLegalDiscard(tile)) return
+    settleDiscard(tile, false)
   }
 
   /** 玩家点击手牌：明显偏离最优解时不立即打出，交由界面弹出提示 */
@@ -512,7 +523,7 @@ export const useGameStore = defineStore('game', () => {
     claimPrompt.value = {
       options: all.filter((item) => item.seat === HUMAN_SEAT),
       tile: pending.tile,
-      canDeclareReady: canDeclareReady(state.value, HUMAN_SEAT),
+      canDeclareReady: canDeclareReady.value,
     }
     return new Promise<ClaimOption | null>((resolve) => {
       claimResolver = resolve
@@ -539,11 +550,20 @@ export const useGameStore = defineStore('game', () => {
     if (selfWinPrompt.value) answerSelfWin(false)
   }
 
-  /** 报听：锁死手牌并放弃本次响应，此后摸打自动胡牌；对局未结束前可随时取消 */
-  function declareReady(): void {
-    if (!claimPrompt.value || !canDeclareReady(state.value, HUMAN_SEAT)) return
+  /**
+   * 报听：锁死手牌，此后只能摸切、摸打自动胡牌；对局未结束前可随时取消。
+   * 等待期与响应期直接锁牌；出牌期须先打出一张进入听牌形态，由系统代打不计战绩。
+   */
+  function declareReady(discard?: number): void {
+    if (!canDeclareReady.value) return
+    if (claimPrompt.value) {
+      human.value.declaredReady = true
+      answerClaim(false)
+      return
+    }
+    if (kongPrompt.value) answerKong(null)
+    if (discard !== undefined) settleDiscard(discard, true)
     human.value.declaredReady = true
-    answerClaim(false)
   }
 
   function cancelReady(): void {
@@ -618,6 +638,8 @@ export const useGameStore = defineStore('game', () => {
     isHumanTurn,
     canDiscard,
     canCancelReady,
+    canDeclareReady,
+    readyDiscards,
     dealer,
     dealerStreak,
     isDealer,

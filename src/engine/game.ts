@@ -14,7 +14,7 @@ import {
   PONG_FROM_HAND,
   type Meld,
 } from './meld'
-import { nextFollowHonor } from './rules'
+import { legalDiscards, nextFollowHonor } from './rules'
 import { scoreWin, shareScore, UNIT, type ScoreResult } from './score'
 import { createWall, isHonor, shuffle } from './tiles'
 import { createSeenCounter } from './ukeire'
@@ -256,10 +256,33 @@ export function canSelfWin(player: PlayerState, jokerTile: number): WinType | nu
   return detectWinType(folded.counts, folded.wildcards, player.melds.length)
 }
 
-/** 能否报听：手牌确已听牌，且尚未报听 */
+/**
+ * 打出后即可听牌的牌张，同值牌只算一种，且受「有风跟打」约束。
+ * 报听锁死手牌，故出牌期必须先打出一张进入听牌形态；手牌已是听牌张数时返回空。
+ */
+export function readyDiscards(state: GameState, seat: number): number[] {
+  const player = state.players[seat]
+  if (player.hand.length <= HAND_SIZE - player.melds.length * 3) return []
+  const legal = new Set(
+    legalDiscards(player.hand, nextFollowHonor(state.lastDiscard, state.jokerTile, player.hand)),
+  )
+  const seen = new Set<number>()
+  return player.hand.filter((tile) => {
+    if (seen.has(tile)) return false
+    seen.add(tile)
+    if (!legal.has(tile)) return false
+    const rest = [...player.hand]
+    rest.splice(player.hand.indexOf(tile), 1)
+    const folded = normalize(rest, state.jokerTile)
+    return shantenCached(folded.counts, folded.wildcards, player.melds.length) === 0
+  })
+}
+
+/** 能否报听：尚未报听，且手牌已处于（或打出一张后即达）听牌形态 */
 export function canDeclareReady(state: GameState, seat: number): boolean {
   const player = state.players[seat]
   if (player.declaredReady) return false
+  if (readyDiscards(state, seat).length > 0) return true
   const folded = normalize(player.hand, state.jokerTile)
   return shantenCached(folded.counts, folded.wildcards, player.melds.length) === 0
 }
